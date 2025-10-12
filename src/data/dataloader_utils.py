@@ -64,12 +64,12 @@ class CIFAR100LTDataModule:
         
         # Define split mappings (removed val_small and calib)
         splits = {
-            'train': ('train_indices', self.cifar_train, self.train_transform),
-            'val': ('val_lt_indices', self.cifar_test, self.eval_transform),
-            'test': ('test_lt_indices', self.cifar_test, self.eval_transform),
-            'tunev': ('tuneV_indices', self.cifar_test, self.eval_transform)
+            'train': ('train', self.cifar_train, self.train_transform),
+            'val': ('val_lt', self.cifar_test, self.eval_transform),
+            'test': ('test_lt', self.cifar_test, self.eval_transform),
+            'tunev': ('tuneV', self.cifar_test, self.eval_transform)
         }
-        
+
         for split_key, (indices_key, base_dataset, transform) in splits.items():
             try:
                 indices = self.load_indices(indices_key)
@@ -78,7 +78,7 @@ class CIFAR100LTDataModule:
                 )
                 print(f"  {split_key}: {len(indices):,} samples")
                 
-            except FileNotFoundError as e:
+            except FileNotFoundError:
                 print(f"  Warning: {split_key} not found, skipping...")
                 continue
                 
@@ -279,6 +279,3 @@ def test_dataloaders():
     except Exception as e:
         print(f"Error testing dataloaders: {e}")
         raise
-
-if __name__ == "__main__":
-    test_dataloaders()

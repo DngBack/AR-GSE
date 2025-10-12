@@ -3,7 +3,7 @@ import json
 import numpy as np
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-from typing import Dict, Any
+from typing import Dict
 from collections import Counter
 
 def create_longtail_val_test_splits(
@@ -37,7 +37,7 @@ def create_longtail_val_test_splits(
         target_count = min(target_count, 100)
         target_test_counts.append(target_count)
     
-    print(f"Target test-LT distribution:")
+    print("Target test-LT distribution:")
     print(f"  Head class: {target_test_counts[0]} samples")
     print(f"  Tail class: {target_test_counts[-1]} samples")
     
@@ -117,7 +117,7 @@ def create_and_save_splits(
         lt_indices: Indices of the full long-tailed training set.
         lt_targets: Corresponding targets for stratification.
         split_ratios: Dictionary with ratios for tuneV, val_small, calib.
-                      The rest will be the 'train' set.
+                    The rest will be the 'train' set.
         output_dir: Directory to save the JSON files.
         seed: Random seed for reproducibility.
     """

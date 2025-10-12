@@ -69,7 +69,6 @@ def generate_longtail_train_set(cifar100_train_dataset, imb_factor: int = 100) -
 
 
 # Data augmentations for CIFAR-100
-
 def get_train_augmentations():
     """
     Get training augmentations for CIFAR-100 following paper specifications.

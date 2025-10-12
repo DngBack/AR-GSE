@@ -271,9 +271,7 @@ def create_tunev_from_test(test_indices: List[int], test_targets: List[int], tun
     
     tunev_targets = test_targets[test_targets == test_targets].tolist()  # Get targets for tunev indices
     remaining_test_targets = test_targets[test_targets == test_targets].tolist()  # Get targets for remaining
-    
-    # Fix target extraction
-    from collections import Counter
+
     tunev_targets = [test_targets[np.where(test_indices == idx)[0][0]] for idx in tunev_indices]
     remaining_test_targets = [test_targets[np.where(test_indices == idx)[0][0]] for idx in remaining_test_indices]
     
@@ -329,7 +327,9 @@ def save_splits_to_json(splits_dict: Dict, output_dir: str):
     print(f"\nSaving splits to {output_dir}...")
     
     for split_name, indices in splits_dict.items():
-        filepath = output_path / f"{split_name}_indices.json"
+        # Remove '_indices' suffix if it exists to avoid duplication
+        clean_name = split_name.replace('_indices', '') if split_name.endswith('_indices') else split_name
+        filepath = output_path / f"{clean_name}_indices.json"
         
         # Convert numpy types to Python native types for JSON serialization
         if hasattr(indices, 'tolist'):
