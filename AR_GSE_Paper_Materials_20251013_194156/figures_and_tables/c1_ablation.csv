@@ -1,0 +1,4 @@
+Method,AURC_Balanced,AURC_Worst,Head_Coverage_Gap,Tail_Coverage_Gap
+Global Threshold,0.135,0.185,0.081,0.124
+Group-wise (No Pinball),0.128,0.162,0.042,0.067
+AR-GSE (Ours),0.118,0.142,0.008,0.015

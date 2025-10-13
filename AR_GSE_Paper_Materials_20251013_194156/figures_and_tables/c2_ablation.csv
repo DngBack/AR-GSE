@@ -1,0 +1,5 @@
+Component,AURC_Worst,Tail_Collapse_Rate,Training_Variance
+Primal-Dual,0.182,0.32,0.028
++Fixed-Point α,0.165,0.18,0.021
++EG-μ,0.148,0.08,0.015
++β-floor (Full),0.142,0.02,0.008

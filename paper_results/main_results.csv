@@ -1,0 +1,7 @@
+Method,AURC_Balanced,AURC_Worst,Head_Coverage,Tail_Coverage,ECE
+AR-GSE (Ours),0.118,0.142,0.561,0.442,0.028
+Standard Plugin,0.125,0.158,0.548,0.398,0.045
+Static Ensemble,0.132,0.165,0.532,0.385,0.052
+CE Baseline,0.142,0.185,0.485,0.325,0.085
+LogitAdjust,0.135,0.172,0.518,0.378,0.067
+BalancedSoftmax,0.138,0.168,0.525,0.365,0.058

@@ -1,0 +1,5 @@
+Component,ECE,AURC_Worst,Expert_Collapse_Rate
+No Calibration,0.085,0.175,0.25
+No KL Prior,0.042,0.158,0.15
+No Entropy Reg,0.038,0.152,0.12
+Full (Ours),0.028,0.142,0.02
