@@ -719,9 +719,9 @@ def main():
         # Compute final best score using per-group thresholds
         from src.train.gse_balanced_plugin import worst_error_on_S_with_per_group_thresholds  
         best_score, _ = worst_error_on_S_with_per_group_thresholds(eta_S2.to(DEVICE), y_S2.to(DEVICE), 
-                                       alpha_star.to(DEVICE), mu_star.to(DEVICE), 
-                                       t_group_star.to(DEVICE), class_to_group.to(DEVICE), num_groups)
-        
+                                    alpha_star.to(DEVICE), mu_star.to(DEVICE), 
+                                    t_group_star.to(DEVICE), class_to_group.to(DEVICE), num_groups)
+    
         
     else:
         print(f"\n=== Running GSE-Balanced Plugin (target_coverage={cov_target:.2f}, objective={objective}) ===")

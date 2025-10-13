@@ -39,34 +39,69 @@ python clean_splits.py
 python -c "from src.data.enhanced_datasets import create_full_cifar100_lt_splits; create_full_cifar100_lt_splits()"
 ```
 
-For detailed usage instructions, see [SPLITS_README.md](SPLITS_README.md).
-
 4. Train expert models:
 
+**Option 1: Using Python Script (Recommended)**
+```bash
+# Train all experts
+python train_experts.py
+
+# Train specific expert
+python train_experts.py --expert ce --verbose
+
+# Show help
+python train_experts.py --help
+```
+
+**Option 2: Using Module Command**
 ```bash
 python -m src.train.train_expert
 ```
 
 5. Train gating model warm up:
 
+**Option 1: Using Python Script (Recommended)**
+```bash
+python train_gating.py --mode pretrain
+```
+
+**Option 2: Using Module Command**
 ```bash
 python -m src.train.train_gating_only --mode pretrain
 ```
 
 6. Train gating for selected expert:
 
+**Option 1: Using Python Script (Recommended)**
+```bash
+python train_gating.py --mode selective
+```
+
+**Option 2: Using Module Command**
 ```bash
 python -m src.train.train_gating_only --mode selective
 ```
 
 7. Train AR-GSE:
 
+**Option 1: Using Python Script (Recommended)**
+```bash
+python train_argse.py --verbose
+```
+
+**Option 2: Using Direct Script**
 ```bash
 python run_improved_eg_outer.py
 ```
 
 8. Evaluate AR-GSE:
 
+**Option 1: Using Python Script (Recommended)**
+```bash
+python evaluate_argse.py --verbose
+```
+
+**Option 2: Using Module Command**
 ```bash
 python -m src.train.eval_agse_plugin.py
 ```
