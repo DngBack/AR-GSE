@@ -75,6 +75,59 @@ def load_test_data():
     
     return stacked_logits, test_labels
 
+def load_aurc_splits_data():
+    """
+    Load tuneV (validation) and val_lt (test) data for proper AURC evaluation.
+    This ensures consistency with the training methodology and preserves long-tail distribution.
+    
+    Returns:
+        Tuple of (val_data, test_data) where each is (logits, labels, indices)
+    """
+    logits_root = Path(CONFIG['experts']['logits_dir']) / CONFIG['dataset']['name']
+    splits_dir = Path(CONFIG['dataset']['splits_dir'])
+    num_experts = len(CONFIG['experts']['names'])
+    num_classes = CONFIG['dataset']['num_classes']
+    
+    # Load splits indices
+    print("📂 Loading AURC evaluation splits...")
+    
+    # tuneV as validation (S1 - used in training for threshold tuning)
+    with open(splits_dir / 'tuneV_indices.json', 'r') as f:
+        tunev_indices = json.load(f)
+    
+    # val_lt as test (S2 - independent evaluation set)  
+    with open(splits_dir / 'val_lt_indices.json', 'r') as f:
+        val_lt_indices = json.load(f)
+    
+    print(f"✅ tuneV (validation): {len(tunev_indices)} samples")
+    print(f"✅ val_lt (test): {len(val_lt_indices)} samples")
+    
+    # Load datasets
+    cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
+    cifar_test_full = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
+    
+    # Load tuneV data (from train set)
+    tunev_logits = torch.zeros(len(tunev_indices), num_experts, num_classes)
+    for i, expert_name in enumerate(CONFIG['experts']['names']):
+        logits_path = logits_root / expert_name / "tuneV_logits.pt"
+        if not logits_path.exists():
+            raise FileNotFoundError(f"Missing logits: {logits_path}")
+        tunev_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
+    
+    tunev_labels = torch.tensor(np.array(cifar_train_full.targets)[tunev_indices])
+    
+    # Load val_lt data (from test set)
+    val_lt_logits = torch.zeros(len(val_lt_indices), num_experts, num_classes)
+    for i, expert_name in enumerate(CONFIG['experts']['names']):
+        logits_path = logits_root / expert_name / "val_lt_logits.pt"
+        if not logits_path.exists():
+            raise FileNotFoundError(f"Missing logits: {logits_path}")
+        val_lt_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
+    
+    val_lt_labels = torch.tensor(np.array(cifar_test_full.targets)[val_lt_indices])
+    
+    return (tunev_logits, tunev_labels, tunev_indices), (val_lt_logits, val_lt_labels, val_lt_indices)
+
 def get_mixture_posteriors(model, logits):
     """Get mixture posteriors η̃(x) from expert logits."""
     model.eval()
@@ -800,34 +853,33 @@ def main():
     print("COMPREHENSIVE AURC EVALUATION")
     print("="*60)
     
+    # Load proper validation and test splits for AURC evaluation
+    # Use tuneV (S1) for threshold tuning and val_lt (S2) for final evaluation
+    # This ensures consistency with training methodology and preserves long-tail distribution
+    aurc_val_data, aurc_test_data = load_aurc_splits_data()
+    tunev_logits, tunev_labels, tunev_indices = aurc_val_data
+    val_lt_logits, val_lt_labels, val_lt_indices = aurc_test_data
+    
     # Load alpha* and mu* from checkpoint for proper GSE margin computation
     alpha_star_cpu = checkpoint['alpha'].cpu()
     mu_star_cpu = checkpoint['mu'].cpu()
     
-    # Use GSE margins as confidence scores
-    gse_margins = compute_margin(eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
+    # Get mixture posteriors for both splits
+    print("🔮 Computing mixture posteriors for AURC evaluation...")
+    tunev_eta_mix = get_mixture_posteriors(model, tunev_logits)
+    val_lt_eta_mix = get_mixture_posteriors(model, val_lt_logits)
     
-    # Split into validation and test (80-20 split) for proper AURC evaluation
-    n_total = len(test_labels)
-    n_val = int(0.8 * n_total)
+    # Compute GSE margins as confidence scores
+    gse_margins_val = compute_margin(tunev_eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
+    gse_margins_test = compute_margin(val_lt_eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
     
-    # Random split with fixed seed for reproducibility
-    torch.manual_seed(CONFIG['seed'])
-    perm = torch.randperm(n_total)
-    val_idx = perm[:n_val]
-    test_idx = perm[n_val:]
+    # Compute predictions for both splits
+    preds_val = (alpha_star_cpu[class_to_group_cpu] * tunev_eta_mix).argmax(dim=1)
+    preds_test = (alpha_star_cpu[class_to_group_cpu] * val_lt_eta_mix).argmax(dim=1)
     
-    # Validation data
-    gse_margins_val = gse_margins[val_idx]
-    preds_val = preds[val_idx]
-    labels_val = test_labels[val_idx]
-    
-    # Test data  
-    gse_margins_test = gse_margins[test_idx]
-    preds_test = preds[test_idx]
-    labels_test = test_labels[test_idx]
-    
-    print(f"📊 AURC Data splits - Val: {len(val_idx)}, Test: {len(test_idx)}")
+    print(f"📊 AURC Data splits - Validation (tuneV): {len(tunev_labels)}, Test (val_lt): {len(val_lt_labels)}")
+    print("✅ Using proper splits: tuneV for threshold tuning, val_lt for final evaluation")
+    print("✅ This ensures consistency with training methodology and preserves long-tail distribution")
     
     # Get cost values and metrics from config
     cost_values = CONFIG['aurc_eval']['cost_values']
@@ -842,8 +894,8 @@ def main():
     for metric in metrics:
         print(f"\n🔄 Processing {metric} metric...")
         rc_points = sweep_cost_values_aurc(
-            gse_margins_val, preds_val, labels_val,
-            gse_margins_test, preds_test, labels_test,
+            gse_margins_val, preds_val, tunev_labels,
+            gse_margins_test, preds_test, val_lt_labels,
             class_to_group_cpu, num_groups, cost_values, metric
         )
         
@@ -937,6 +989,8 @@ def main():
     print("="*60)
     print(f"Dataset: {CONFIG['dataset']['name']}")
     print(f"Test samples: {num_test_samples}")
+    print(f"AURC Validation samples (tuneV): {len(tunev_labels)}")
+    print(f"AURC Test samples (val_lt): {len(val_lt_labels)}")
     print(f"Optimal parameters: α*={alpha_star.cpu().tolist()}, μ*={mu_star.cpu().tolist()}")
     
     # Handle threshold display
@@ -952,14 +1006,18 @@ def main():
     
     print()
     print("Key Results:")
-    print("📊 Traditional RC Metrics (using margins from existing method):")
+    print("📊 Traditional RC Metrics (using test_lt split for direct comparison):")
     print(f"• AURC (Balanced): {aurc_bal:.4f}")
     print(f"• AURC (Worst): {aurc_wst:.4f}") 
     
-    print("\n🎯 Comprehensive AURC (following 'Learning to Reject' methodology):")
+    print("\n🎯 Comprehensive AURC (using tuneV→val_lt methodology):")
+    print("   • Validation split: tuneV (for threshold tuning)")
+    print("   • Test split: val_lt (for final evaluation)")
+    print("   • Consistent with training methodology")
+    print("   • Preserves long-tail distribution")
     for metric in ['standard', 'balanced', 'worst']:
         if metric in aurc_results:
-            print(f"• {metric.upper()} AURC: {aurc_results[metric]:.6f}")
+            print(f"   • {metric.upper()} AURC: {aurc_results[metric]:.6f}")
     
     if t_group is not None:
         print(f"\n• Plugin @ per-group thresholds: Coverage={plugin_metrics['coverage']:.3f}, "
