@@ -49,7 +49,7 @@ CONFIG = {
     },
     'aurc_eval': {
         'cost_values': np.linspace(0.0, 1.0, 81),  # 81 cost values from 0 to 1.0
-        'metrics': ['standard', 'balanced', 'worst'],
+        'metrics': ['balanced', 'worst'],  # Focus on group-aware metrics only
     },
     'plugin_checkpoint': './checkpoints/argse_worst_eg_improved/cifar100_lt_if100/gse_balanced_plugin.ckpt',
     'output_dir': './results_worst_eg_improved/cifar100_lt_if100',
@@ -155,6 +155,8 @@ def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K,
     """
     Compute group-aware risk for AURC evaluation on accepted samples.
     
+    Focuses on group-aware metrics (balanced and worst) with proper reweighting.
+    
     Args:
         preds: [N] predictions
         labels: [N] true labels  
@@ -162,7 +164,7 @@ def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K,
         class_to_group: [C] class to group mapping
         K: number of groups
         class_weights: dict mapping class_id -> weight (for reweighting), or None
-        metric_type: 'standard', 'balanced', or 'worst'
+        metric_type: 'balanced' or 'worst' (standard removed)
         
     Returns:
         risk: scalar risk value (error rate)
@@ -173,19 +175,7 @@ def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K,
     y = labels
     g = class_to_group[y]
     
-    if metric_type == 'standard':
-        correct = (preds[accepted_mask] == y[accepted_mask])
-        
-        # Apply reweighting if class_weights provided
-        if class_weights is not None:
-            weights = torch.tensor([class_weights[int(c)] for c in y[accepted_mask]], 
-                                  dtype=torch.float32)
-            weighted_correct = (correct.float() * weights).sum()
-            total_weight = weights.sum()
-            return 1.0 - (weighted_correct / total_weight).item()
-        else:
-            return 1.0 - correct.float().mean().item()
-    
+    # Compute group-wise errors with reweighting
     group_errors = []
     for k in range(K):
         group_mask = (g == k)
@@ -206,12 +196,13 @@ def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K,
                 group_error = 1.0 - group_correct.float().mean().item()
             
             group_errors.append(group_error)
+    
     if metric_type == 'balanced':
         return float(np.mean(group_errors))
     elif metric_type == 'worst':
         return float(np.max(group_errors))
     else:
-        raise ValueError(f"Unknown metric type: {metric_type}")
+        raise ValueError(f"Unknown metric type: {metric_type}. Use 'balanced' or 'worst'.")
 
 def find_optimal_threshold_for_cost(confidence_scores, preds, labels, class_to_group, K, 
                                    cost_c, class_weights=None, metric_type="balanced"):
@@ -378,65 +369,69 @@ def compute_aurc_from_points(rc_points, coverage_range='full'):
 #############################################
 
 def plot_aurc_curves(all_rc_points, aurc_results, save_path):
-    """Plot risk-coverage curves for different metrics."""
+    """Plot risk-coverage curves for balanced and worst metrics."""
     plt.figure(figsize=(15, 5))
     
-    colors = ['blue', 'red', 'green', 'orange']
-    linestyles = ['-', '--', '-.', ':']
+    # Colors for balanced and worst metrics
+    colors = {'balanced': 'blue', 'worst': 'red'}
+    linestyles = {'balanced': '-', 'worst': '--'}
     
     # Full range plot
     plt.subplot(1, 3, 1)
-    for i, (metric, rc_points) in enumerate(all_rc_points.items()):
+    for metric, rc_points in all_rc_points.items():
         rc_points = sorted(rc_points, key=lambda x: x[1])
         coverages = [p[1] for p in rc_points]
         risks = [p[2] for p in rc_points]
         
         aurc = aurc_results[metric]
-        plt.plot(coverages, risks, color=colors[i % len(colors)], 
-                linestyle=linestyles[i % len(linestyles)], linewidth=2,
+        plt.plot(coverages, risks, color=colors[metric], 
+                linestyle=linestyles[metric], linewidth=2,
                 label=f'{metric.title()} (AURC={aurc:.4f})')
     
-    plt.xlabel('Coverage (Fraction Accepted)')
-    plt.ylabel('Risk (Error on Accepted)')
-    plt.title('Risk-Coverage Curves (Full Range)')
+    plt.xlabel('Coverage (Fraction Accepted)', fontsize=12)
+    plt.ylabel('Risk (Error on Accepted)', fontsize=12)
+    plt.title('Risk-Coverage Curves (Full Range)', fontsize=14, fontweight='bold')
     plt.grid(True, alpha=0.3)
-    plt.legend()
+    plt.legend(fontsize=11)
     plt.xlim(0, 1)
     plt.ylim(0, None)
     
     # Focused range plot (0.2-1.0)
     plt.subplot(1, 3, 2)
-    for i, (metric, rc_points) in enumerate(all_rc_points.items()):
+    for metric, rc_points in all_rc_points.items():
         rc_points = sorted(rc_points, key=lambda x: x[1])
         coverages = [p[1] for p in rc_points if p[1] >= 0.2]
         risks = [p[2] for p in rc_points if p[1] >= 0.2]
         
-        plt.plot(coverages, risks, color=colors[i % len(colors)], 
-                linestyle=linestyles[i % len(linestyles)], linewidth=2,
+        plt.plot(coverages, risks, color=colors[metric], 
+                linestyle=linestyles[metric], linewidth=2,
                 label=f'{metric.title()}')
     
-    plt.xlabel('Coverage (Fraction Accepted)')
-    plt.ylabel('Risk (Error on Accepted)')
-    plt.title('Risk-Coverage Curves (0.2-1.0)')
+    plt.xlabel('Coverage (Fraction Accepted)', fontsize=12)
+    plt.ylabel('Risk (Error on Accepted)', fontsize=12)
+    plt.title('Risk-Coverage Curves (0.2-1.0)', fontsize=14, fontweight='bold')
     plt.grid(True, alpha=0.3)
-    plt.legend()
+    plt.legend(fontsize=11)
     plt.xlim(0.2, 1.0)
     plt.ylim(0, None)
     
     # AURC comparison bar plot
     plt.subplot(1, 3, 3)
     metrics = list(aurc_results.keys())
-    aurcs = list(aurc_results.values())
+    # Filter to only show full range AURC (not _02_10 versions)
+    main_metrics = [m for m in metrics if not m.endswith('_02_10')]
+    aurcs = [aurc_results[m] for m in main_metrics]
     
-    bars = plt.bar(metrics, aurcs, color=colors[:len(metrics)], alpha=0.7)
-    plt.ylabel('AURC Value')
-    plt.title('AURC Comparison')
-    plt.xticks(rotation=45)
+    bar_colors = [colors[m] for m in main_metrics]
+    bars = plt.bar(main_metrics, aurcs, color=bar_colors, alpha=0.7, edgecolor='black', linewidth=1.5)
+    plt.ylabel('AURC Value', fontsize=12)
+    plt.title('AURC Comparison (Full Range)', fontsize=14, fontweight='bold')
+    plt.xticks(rotation=0, fontsize=11)
     
     # Add value labels on bars
     for bar, aurc in zip(bars, aurcs):
         plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
-                f'{aurc:.4f}', ha='center', va='bottom')
+                f'{aurc:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -591,7 +586,8 @@ def main():
 
     # 7) Final summary
     print("\n" + "="*60)
-    print("FINAL AURC RESULTS (REWEIGHTED FOR LONG-TAIL)" if class_weights else "FINAL AURC RESULTS")
+    print("FINAL AURC RESULTS - GROUP-AWARE METRICS")
+    print("(REWEIGHTED FOR LONG-TAIL)" if class_weights else "(UNIFORM WEIGHTING)")
     print("="*60)
     print("\n📊 AURC (Full Range 0-1):")
     for metric in metrics:
@@ -599,11 +595,29 @@ def main():
     print("\n📊 AURC (Practical Range 0.2-1):")
     for metric in metrics:
         print(f"   • {metric.upper():>12} AURC: {aurc_results.get(f'{metric}_02_10', float('nan')):.6f}")
+    
+    # Show which metric is better
+    balanced_aurc = aurc_results['balanced']
+    worst_aurc = aurc_results['worst']
+    print("\n" + "="*60)
+    print("📈 METRIC COMPARISON:")
+    print(f"   • BALANCED Error: {balanced_aurc:.6f} (average of group errors)")
+    print(f"   • WORST Error:    {worst_aurc:.6f} (maximum group error)")
+    diff = abs(worst_aurc - balanced_aurc)
+    print(f"   • Difference:     {diff:.6f}")
+    if worst_aurc > balanced_aurc:
+        print(f"   ⚠️  Worst-group error is {((worst_aurc/balanced_aurc - 1)*100):.1f}% higher than balanced")
+        print(f"   → Indicates group disparity in performance")
+    else:
+        print(f"   ✅ Groups are relatively balanced")
+    
     print("="*60)
     if class_weights:
         print("✅ Metrics reweighted by train class distribution (proper long-tail evaluation)")
     print("📝 Lower AURC is better (less area under risk-coverage curve)")
     print("🎯 Methodology: Optimize thresholds on (tunev + val), evaluate on test")
+    print("🎯 Focus: Group-aware fairness (balanced & worst-group metrics)")
+    print("="*60)
 
 if __name__ == '__main__':
     main()
