@@ -1,24 +1,37 @@
-# src/train/eval_gse_plugin.py
 """
-Evaluation script for GSE-Balanced plugin results.
-Loads optimal (α*, μ*) and evaluates on test set.
+Comprehensive AURC Evaluation (Correct Methodology)
+
+This script follows the proper AURC evaluation methodology:
+  - Validation set: tuneV + val_lt (combined for threshold optimization)
+  - Test set: test_lt (held-out for final evaluation)
+
+The algorithm:
+  1. For each rejection cost c and metric (standard/balanced/worst):
+     - Find optimal threshold on validation set (tuneV + val_lt)
+     - Apply that threshold to test set (test_lt) to measure coverage and risk
+  2. Compute AURC by integrating risk over coverage
+
+It loads optimal parameters (α*, μ*, and gating) from the plugin checkpoint,
+computes mixture posteriors, constructs GSE margins as confidence scores, and
+then sweeps rejection costs to produce risk–coverage curves.
+
+Outputs:
+  - aurc_detailed_results.csv: RC points for each metric
+  - aurc_summary.json: AURC values for full and [0.2, 1.0] coverage ranges
+  - aurc_curves.png: plots of RC curves and AURC comparison
 """
-import torch
-import torchvision
-import numpy as np
-import pandas as pd
+
 import json
-import matplotlib.pyplot as plt
 from pathlib import Path
 
-# Import our custom modules
-from src.models.argse import AR_GSE
-from src.metrics.selective_metrics import calculate_selective_errors
-from src.metrics.rc_curve import generate_rc_curve, generate_rc_curve_from_02, calculate_aurc, calculate_aurc_from_02
-from src.metrics.calibration import calculate_ece
-from src.metrics.bootstrap import bootstrap_ci
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+import torchvision
 
-# Import plugin functions
+# Custom modules
+from src.models.argse import AR_GSE
 from src.train.gse_balanced_plugin import compute_margin
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -29,59 +42,31 @@ CONFIG = {
         'splits_dir': './data/cifar100_lt_if100_splits',
         'num_classes': 100,
     },
-    'grouping': {
-        'threshold': 20,
-    },
     'experts': {
         'names': ['ce_baseline', 'logitadjust_baseline', 'balsoftmax_baseline'],
         'logits_dir': './outputs/logits',
     },
-    'eval_params': {
-        'coverage_points': [0.7, 0.8, 0.9],
-        'bootstrap_n': 1000,
-    },
     'aurc_eval': {
         'cost_values': np.linspace(0.0, 1.0, 81),  # 81 cost values from 0 to 1.0
         'metrics': ['standard', 'balanced', 'worst'],
-        'n_repeats': 5,  # Number of bootstrap repeats for confidence intervals
     },
     'plugin_checkpoint': './checkpoints/argse_worst_eg_improved/cifar100_lt_if100/gse_balanced_plugin.ckpt',
     'output_dir': './results_worst_eg_improved/cifar100_lt_if100',
-    'seed': 42
+    'seed': 42,
 }
 
-def load_test_data():
-    """Load test logits and labels."""
-    logits_root = Path(CONFIG['experts']['logits_dir']) / CONFIG['dataset']['name']
-    splits_dir = Path(CONFIG['dataset']['splits_dir'])
-    
-    with open(splits_dir / 'test_lt_indices.json', 'r') as f:
-        test_indices = json.load(f)
-    num_test_samples = len(test_indices)
-    
-    # Load expert logits for test set
-    num_experts = len(CONFIG['experts']['names'])
-    stacked_logits = torch.zeros(num_test_samples, num_experts, CONFIG['dataset']['num_classes'])
-    
-    for i, expert_name in enumerate(CONFIG['experts']['names']):
-        logits_path = logits_root / expert_name / "test_lt_logits.pt"
-        if not logits_path.exists():
-            raise FileNotFoundError(f"Logits file not found: {logits_path}")
-        stacked_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
-    
-    # Load test labels
-    full_test_dataset = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
-    test_labels = torch.tensor(np.array(full_test_dataset.targets)[test_indices])
-    
-    return stacked_logits, test_labels
+#############################################
+# Data loading for comprehensive AURC only  #
+#############################################
 
 def load_aurc_splits_data():
     """
-    Load tuneV (validation) and val_lt (test) data for proper AURC evaluation.
-    This ensures consistency with the training methodology and preserves long-tail distribution.
+    Load all three splits for proper AURC evaluation:
+      - tuneV + val_lt: combined as validation set for threshold optimization
+      - test_lt: held-out test set for final evaluation
     
     Returns:
-        Tuple of (val_data, test_data) where each is (logits, labels, indices)
+        Tuple of (tunev_data, val_lt_data, test_data) where each is (logits, labels, indices)
     """
     logits_root = Path(CONFIG['experts']['logits_dir']) / CONFIG['dataset']['name']
     splits_dir = Path(CONFIG['dataset']['splits_dir'])
@@ -91,16 +76,22 @@ def load_aurc_splits_data():
     # Load splits indices
     print("📂 Loading AURC evaluation splits...")
     
-    # tuneV as validation (S1 - used in training for threshold tuning)
+    # tuneV (from train set)
     with open(splits_dir / 'tuneV_indices.json', 'r') as f:
         tunev_indices = json.load(f)
     
-    # val_lt as test (S2 - independent evaluation set)  
+    # val_lt (from test set)
     with open(splits_dir / 'val_lt_indices.json', 'r') as f:
         val_lt_indices = json.load(f)
     
-    print(f"✅ tuneV (validation): {len(tunev_indices)} samples")
-    print(f"✅ val_lt (test): {len(val_lt_indices)} samples")
+    # test_lt (from test set)
+    with open(splits_dir / 'test_lt_indices.json', 'r') as f:
+        test_lt_indices = json.load(f)
+    
+    print(f"✅ tuneV: {len(tunev_indices)} samples (train set)")
+    print(f"✅ val_lt: {len(val_lt_indices)} samples (test set)")
+    print(f"✅ test_lt: {len(test_lt_indices)} samples (test set)")
+    print(f"✅ Validation (tuneV + val_lt): {len(tunev_indices) + len(val_lt_indices)} samples")
     
     # Load datasets
     cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
@@ -113,7 +104,6 @@ def load_aurc_splits_data():
         if not logits_path.exists():
             raise FileNotFoundError(f"Missing logits: {logits_path}")
         tunev_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
-    
     tunev_labels = torch.tensor(np.array(cifar_train_full.targets)[tunev_indices])
     
     # Load val_lt data (from test set)
@@ -123,194 +113,54 @@ def load_aurc_splits_data():
         if not logits_path.exists():
             raise FileNotFoundError(f"Missing logits: {logits_path}")
         val_lt_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
-    
     val_lt_labels = torch.tensor(np.array(cifar_test_full.targets)[val_lt_indices])
     
-    return (tunev_logits, tunev_labels, tunev_indices), (val_lt_logits, val_lt_labels, val_lt_indices)
+    # Load test_lt data (from test set)
+    test_lt_logits = torch.zeros(len(test_lt_indices), num_experts, num_classes)
+    for i, expert_name in enumerate(CONFIG['experts']['names']):
+        logits_path = logits_root / expert_name / "test_lt_logits.pt"
+        if not logits_path.exists():
+            raise FileNotFoundError(f"Missing logits: {logits_path}")
+        test_lt_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
+    test_lt_labels = torch.tensor(np.array(cifar_test_full.targets)[test_lt_indices])
+    
+    return (tunev_logits, tunev_labels, tunev_indices), (val_lt_logits, val_lt_labels, val_lt_indices), (test_lt_logits, test_lt_labels, test_lt_indices)
 
 def get_mixture_posteriors(model, logits):
-    """Get mixture posteriors η̃(x) from expert logits."""
+    """Compute mixture posteriors η̃(x) from expert logits."""
     model.eval()
     with torch.no_grad():
         logits = logits.to(DEVICE)
-        
-        # Get expert posteriors
-        expert_posteriors = torch.softmax(logits, dim=-1)  # [B, E, C]
-        
-        # Get gating weights
+        expert_posteriors = torch.softmax(logits, dim=-1)              # [B, E, C]
         gating_features = model.feature_builder(logits)
         gating_weights = torch.softmax(model.gating_net(gating_features), dim=1)  # [B, E]
-        
-        # Mixture posteriors
-        eta_mix = torch.einsum('be,bec->bc', gating_weights, expert_posteriors)  # [B, C]
-        
+        eta_mix = torch.einsum('be,bec->bc', gating_weights, expert_posteriors)   # [B, C]
     return eta_mix.cpu()
 
-def analyze_group_performance(eta_mix, preds, labels, accepted, alpha, mu, threshold, class_to_group, K):
-    """
-    Analyze detailed per-group performance metrics.
-    """
-    print("\n" + "="*50)
-    print("DETAILED GROUP-WISE ANALYSIS")
-    print("="*50)
-    
-    # Ensure all tensors are on same device
-    device = eta_mix.device
-    class_to_group = class_to_group.to(device)
-    y_groups = class_to_group[labels]
-    
-    for k in range(K):
-        group_name = "Head" if k == 0 else "Tail"
-        group_mask = (y_groups == k)
-        group_size = group_mask.sum().item()
-        
-        if group_size == 0:
-            continue
-            
-        # Coverage and error for this group
-        group_accepted = accepted[group_mask]
-        group_coverage = group_accepted.float().mean().item()
-        
-        # TPR/FPR analysis for this group
-        group_preds_all = preds[group_mask]
-        group_labels_all = labels[group_mask]
-        group_correct = (group_preds_all == group_labels_all)
-        
-        # True Positive Rate (TPR): fraction of correct predictions that are accepted
-        correct_accepted = group_accepted & group_correct
-        tpr = correct_accepted.sum().item() / group_correct.sum().item() if group_correct.sum() > 0 else 0.0
-        
-        # False Positive Rate (FPR): fraction of incorrect predictions that are accepted  
-        incorrect_accepted = group_accepted & (~group_correct)
-        fpr = incorrect_accepted.sum().item() / (~group_correct).sum().item() if (~group_correct).sum() > 0 else 0.0
-        
-        if group_accepted.sum() > 0:
-            group_preds = preds[group_mask & accepted]
-            group_labels = labels[group_mask & accepted]
-            group_accuracy = (group_preds == group_labels).float().mean().item()
-            group_error = 1.0 - group_accuracy
-        else:
-            group_error = 1.0
-            
-        # Raw margin statistics for this group
-        raw_margins = compute_margin(eta_mix[group_mask], alpha, mu, 0.0, class_to_group)
-        margin_mean = raw_margins.mean().item()
-        margin_std = raw_margins.std().item()
-        margin_min = raw_margins.min().item()
-        margin_max = raw_margins.max().item()
-        
-        print(f"\n{group_name} Group (k={k}):")
-        print(f"  • Size: {group_size} samples")
-        print(f"  • Coverage: {group_coverage:.3f}")
-        print(f"  • Error: {group_error:.3f}")
-        print(f"  • TPR (correct accepted): {tpr:.3f}")
-        print(f"  • FPR (incorrect accepted): {fpr:.3f}")
-        print(f"  • α_k: {alpha[k]:.3f}")
-        print(f"  • μ_k: {mu[k]:.3f}")
-        # Show the threshold for this group
-        group_threshold_val = threshold[k] if isinstance(threshold, (list, torch.Tensor)) and len(threshold) > k else threshold
-        print(f"  • τ_k: {group_threshold_val:.3f}")
-        print(f"  • Raw margin stats: μ={margin_mean:.3f}, σ={margin_std:.3f}, range=[{margin_min:.3f}, {margin_max:.3f}]")
-        
-        # Check separation quality
-        accepted_margins = raw_margins[group_accepted]
-        rejected_margins = raw_margins[~group_accepted]
-        
-        if len(accepted_margins) > 0 and len(rejected_margins) > 0:
-            separation = accepted_margins.min().item() - rejected_margins.max().item()
-            # Use the appropriate threshold for this group
-            group_threshold = threshold[k] if isinstance(threshold, (list, torch.Tensor)) and len(threshold) > k else threshold
-            overlap_ratio = (rejected_margins > group_threshold).sum().item() / len(rejected_margins)
-            print(f"  • Margin separation: {separation:.3f}")
-            print(f"  • Overlap ratio: {overlap_ratio:.3f}")
-    
-    print("\n" + "="*50)
+#############################################
+# Core AURC utilities                        #
+#############################################
 
-
-def selective_risk_from_mask(preds, labels, accepted_mask, c_cost, class_to_group, K, kind="balanced"):
-    """
-    Compute selective risk with rejection cost c_cost.
-    Risk = error_rate * coverage + c_cost * (1 - coverage) for each group
-    """
-    y = labels
-    g = class_to_group[y]
-    
-    if kind == "balanced":
-        vals = []
-        for k in range(K):
-            mk = (g == k)
-            if mk.sum() == 0:
-                vals.append(c_cost)  # No samples in group k
-                continue
-                
-            acc_k = accepted_mask[mk].float().mean().item()
-            
-            if accepted_mask[mk].sum() == 0:
-                err_k = 1.0  # No accepted samples, assume error = 1.0
-            else:
-                err_k = (preds[mk & accepted_mask] != y[mk & accepted_mask]).float().mean().item()
-            
-            risk_k = err_k * acc_k + c_cost * (1.0 - acc_k)
-            vals.append(risk_k)
-        return float(np.mean(vals))
-    else:  # worst-group risk
-        worst = 0.0
-        for k in range(K):
-            mk = (g == k)
-            if mk.sum() == 0:
-                worst = max(worst, c_cost)
-                continue
-                
-            acc_k = accepted_mask[mk].float().mean().item()
-            
-            if accepted_mask[mk].sum() == 0:
-                err_k = 1.0
-            else:
-                err_k = (preds[mk & accepted_mask] != y[mk & accepted_mask]).float().mean().item()
-            
-            risk_k = err_k * acc_k + c_cost * (1.0 - acc_k)
-            worst = max(worst, risk_k)
-        return worst
 
 def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K, metric_type="balanced"):
-    """
-    Compute group-aware risk for AURC evaluation.
-    
-    Args:
-        preds: [N] predictions
-        labels: [N] true labels
-        accepted_mask: [N] acceptance mask
-        class_to_group: [C] class to group mapping
-        K: number of groups
-        metric_type: 'standard', 'balanced', or 'worst'
-    
-    Returns:
-        risk: scalar risk value
-    """
+    """Compute group-aware risk for AURC evaluation on accepted samples."""
     if accepted_mask.sum() == 0:
-        return 1.0  # All rejected -> max risk
-    
+        return 1.0
     y = labels
     g = class_to_group[y]
-    
     if metric_type == 'standard':
-        # Standard error (overall accuracy on accepted)
         correct = (preds[accepted_mask] == y[accepted_mask])
         return 1.0 - correct.float().mean().item()
-    
-    # Group-aware metrics
     group_errors = []
     for k in range(K):
         group_mask = (g == k)
         group_accepted = accepted_mask & group_mask
-        
         if group_accepted.sum() == 0:
-            group_errors.append(1.0)  # No accepted samples in this group
+            group_errors.append(1.0)
         else:
             group_correct = (preds[group_accepted] == y[group_accepted])
             group_error = 1.0 - group_correct.float().mean().item()
             group_errors.append(group_error)
-    
     if metric_type == 'balanced':
         return float(np.mean(group_errors))
     elif metric_type == 'worst':
@@ -422,20 +272,39 @@ def compute_aurc_from_points(rc_points, coverage_range='full'):
     risks = [p[2] for p in rc_points]
     
     if coverage_range == '0.2-1.0':
-        # Filter points in range [0.2, 1.0]
-        filtered = [(c, r) for c, r in zip(coverages, risks) if c >= 0.2]
-        if not filtered:
+        # Need to interpolate risk at coverage=0.2 BEFORE filtering
+        # Find points around 0.2 for interpolation
+        all_points = list(zip(coverages, risks))
+        
+        # Find the last point with coverage < 0.2 and first point with coverage >= 0.2
+        points_below = [(c, r) for c, r in all_points if c < 0.2]
+        points_above = [(c, r) for c, r in all_points if c >= 0.2]
+        
+        if not points_above:
+            # No points >= 0.2, cannot compute
             return float('nan')
-        coverages, risks = zip(*filtered)
-        coverages = list(coverages)
-        risks = list(risks)
         
-        # Ensure endpoints
-        if coverages[0] > 0.2:
-            coverages = [0.2] + coverages
-            # Interpolate risk at 0.2
-            risks = [risks[0]] + risks
+        # Interpolate risk at coverage = 0.2
+        if points_below:
+            # Have points on both sides of 0.2
+            c_below, r_below = points_below[-1]  # Last point before 0.2
+            c_above, r_above = points_above[0]   # First point after 0.2
+            
+            if c_above > c_below:
+                # Linear interpolation
+                risk_at_02 = r_below + (r_above - r_below) * (0.2 - c_below) / (c_above - c_below)
+            else:
+                # Should not happen, but use r_above as fallback
+                risk_at_02 = r_above
+        else:
+            # No points below 0.2, use first point's risk
+            risk_at_02 = points_above[0][1]
         
+        # Build final curve starting from 0.2
+        coverages = [0.2] + [c for c, r in points_above]
+        risks = [risk_at_02] + [r for c, r in points_above]
+        
+        # Ensure endpoint at 1.0
         if coverages[-1] < 1.0:
             coverages = coverages + [1.0]
             risks = risks + [risks[-1]]
@@ -444,7 +313,9 @@ def compute_aurc_from_points(rc_points, coverage_range='full'):
         # Ensure we have endpoints for proper integration
         if coverages[0] > 0.0:
             coverages = [0.0] + coverages
-            risks = [0.0] + risks  # Risk is 0 when coverage is 0
+            # When coverage=0 (reject all), risk should be very high (no correct predictions)
+            # Use the first available risk as approximation (conservative)
+            risks = [risks[0]] + risks
         
         if coverages[-1] < 1.0:
             coverages = coverages + [1.0]
@@ -453,113 +324,9 @@ def compute_aurc_from_points(rc_points, coverage_range='full'):
     # Trapezoidal integration
     aurc = np.trapz(risks, coverages)
     return aurc
-
-def evaluate_aurc_comprehensive(eta_mix, preds, labels, class_to_group, K, output_dir):
-    """
-    Comprehensive AURC evaluation following "Learning to Reject Meets Long-tail Learning" methodology.
-    
-    Args:
-        eta_mix: [N] mixture posteriors 
-        preds: [N] predictions
-        labels: [N] true labels
-        class_to_group: [C] class to group mapping
-        K: number of groups
-        output_dir: output directory path
-        
-    Returns:
-        aurc_results: dict with AURC results for different metrics
-    """
-    print("\n" + "="*60)
-    print("COMPREHENSIVE AURC EVALUATION")
-    print("="*60)
-    
-    # Use GSE margins as confidence scores
-    alpha_star = torch.tensor([1.0, 1.0])  # Placeholder - will be loaded from checkpoint
-    mu_star = torch.tensor([0.0, 0.0])     # Placeholder - will be loaded from checkpoint
-    confidence_scores = compute_margin(eta_mix, alpha_star, mu_star, 0.0, class_to_group)
-    
-    # Split into validation and test (80-20 split)
-    n_total = len(labels)
-    n_val = int(0.8 * n_total)
-    
-    # Random split with fixed seed for reproducibility
-    torch.manual_seed(CONFIG['seed'])
-    perm = torch.randperm(n_total)
-    val_idx = perm[:n_val]
-    test_idx = perm[n_val:]
-    
-    # Validation data
-    confidence_val = confidence_scores[val_idx]
-    preds_val = preds[val_idx]
-    labels_val = labels[val_idx]
-    
-    # Test data
-    confidence_test = confidence_scores[test_idx]
-    preds_test = preds[test_idx]
-    labels_test = labels[test_idx]
-    
-    print(f"📊 Data splits - Val: {len(val_idx)}, Test: {len(test_idx)}")
-    
-    # Get cost values and metrics from config
-    cost_values = CONFIG['aurc_eval']['cost_values']
-    metrics = CONFIG['aurc_eval']['metrics']
-    
-    print(f"🎯 Cost grid: {len(cost_values)} values from {cost_values[0]:.1f} to {cost_values[-1]:.1f}")
-    
-    # Sweep costs for different metrics
-    aurc_results = {}
-    all_rc_points = {}
-    
-    for metric in metrics:
-        print(f"\n🔄 Processing {metric} metric...")
-        rc_points = sweep_cost_values_aurc(
-            confidence_val, preds_val, labels_val,
-            confidence_test, preds_test, labels_test,
-            class_to_group, K, cost_values, metric
-        )
-        
-        # Compute AURC for full range [0, 1]
-        aurc_full = compute_aurc_from_points(rc_points, coverage_range='full')
-        aurc_results[metric] = aurc_full
-        
-        # Compute AURC for range [0.2, 1.0]
-        aurc_02_10 = compute_aurc_from_points(rc_points, coverage_range='0.2-1.0')
-        aurc_results[f'{metric}_02_10'] = aurc_02_10
-        
-        all_rc_points[metric] = rc_points
-        
-        print(f"✅ {metric.upper()} AURC (0-1):     {aurc_full:.6f}")
-        print(f"✅ {metric.upper()} AURC (0.2-1):   {aurc_02_10:.6f}")
-    
-    # Save detailed results
-    print(f"\n💾 Saving AURC results to {output_dir}...")
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    # Save RC points as CSV
-    results_df = []
-    for metric, rc_points in all_rc_points.items():
-        for cost_c, coverage, risk in rc_points:
-            results_df.append({
-                'metric': metric,
-                'cost': cost_c,
-                'coverage': coverage,
-                'risk': risk
-            })
-    
-    results_df = pd.DataFrame(results_df)
-    results_df.to_csv(output_path / 'aurc_detailed_results.csv', index=False)
-    
-    # Save AURC summary
-    with open(output_path / 'aurc_summary.json', 'w') as f:
-        json.dump(aurc_results, f, indent=4)
-    
-    # Plot RC curves
-    plot_aurc_curves(all_rc_points, aurc_results, output_path / 'aurc_curves.png')
-    
-    print("✅ AURC evaluation completed!")
-    
-    return aurc_results, all_rc_points
+#############################################
+# Plotting                                    
+#############################################
 
 def plot_aurc_curves(all_rc_points, aurc_results, save_path):
     """Plot risk-coverage curves for different metrics."""
@@ -627,58 +394,41 @@ def plot_aurc_curves(all_rc_points, aurc_results, save_path):
     print(f"📊 Saved AURC plots to {save_path}")
 
 def main():
+    # Reproducibility
     torch.manual_seed(CONFIG['seed'])
     np.random.seed(CONFIG['seed'])
-    
-    print("=== GSE-Balanced Plugin Evaluation ===")
-    
-    # Create output directory
+
+    print("=== Comprehensive AURC Evaluation (tuneV → val_lt) ===")
+
+    # Output directory
     output_dir = Path(CONFIG['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 1. Load plugin checkpoint
+
+    # 1) Load plugin checkpoint (α*, μ*, class_to_group, gating)
     plugin_ckpt_path = Path(CONFIG['plugin_checkpoint'])
     if not plugin_ckpt_path.exists():
         raise FileNotFoundError(f"Plugin checkpoint not found: {plugin_ckpt_path}")
-    
     print(f"📂 Loading plugin checkpoint: {plugin_ckpt_path}")
     checkpoint = torch.load(plugin_ckpt_path, map_location=DEVICE, weights_only=False)
-    
     alpha_star = checkpoint['alpha'].to(DEVICE)
     mu_star = checkpoint['mu'].to(DEVICE)
     class_to_group = checkpoint['class_to_group'].to(DEVICE)
     num_groups = checkpoint['num_groups']
-    plugin_threshold = checkpoint.get('threshold', checkpoint.get('c'))  # Backward compatibility
-    
+
     print("✅ Loaded optimal parameters:")
-    print(f"   α* = [{alpha_star[0]:.4f}, {alpha_star[1]:.4f}]")
-    print(f"   μ* = [{mu_star[0]:.4f}, {mu_star[1]:.4f}]")
-    
-    # Handle both single threshold and per-group thresholds
-    if isinstance(plugin_threshold, list):
-        print(f"   per-group thresholds t* = {plugin_threshold}")
-    else:
-        print(f"   raw-margin threshold t* = {plugin_threshold:.3f}")
-    if 'best_score' in checkpoint:
-        print(f"   Best S2 score = {checkpoint['best_score']:.4f}")
-    if 'source' in checkpoint:
-        print(f"   Source: {checkpoint['source']}")
-    if 'improvement' in checkpoint:
-        print(f"   Expected improvement: {checkpoint['improvement']:.1f}%")
-    
-    # 2. Set up model with optimal parameters
+    print(f"   α* = {alpha_star.detach().cpu().tolist()}")
+    print(f"   μ* = {mu_star.detach().cpu().tolist()}")
+
+    # 2) Build AR-GSE and load gating
     num_experts = len(CONFIG['experts']['names'])
-    
-    # Compute dynamic gating feature dimension (enriched features)
     with torch.no_grad():
         dummy_logits = torch.zeros(2, num_experts, CONFIG['dataset']['num_classes']).to(DEVICE)
         temp_model = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, 1).to(DEVICE)
         gating_feature_dim = temp_model.feature_builder(dummy_logits).size(-1)
         del temp_model
     print(f"✅ Dynamic gating feature dim: {gating_feature_dim}")
-    
     model = AR_GSE(num_experts, CONFIG['dataset']['num_classes'], num_groups, gating_feature_dim).to(DEVICE)
-    
+
     # Load gating network weights with dimension compatibility check
     if 'gating_net_state_dict' in checkpoint:
         saved_state = checkpoint['gating_net_state_dict']
@@ -697,339 +447,99 @@ def main():
             print("❌ Gating checkpoint incompatible with enriched features. Using random weights.")
     else:
         print("⚠️ No gating network weights found in checkpoint")
-    
+
     # Set optimal α*, μ*
     with torch.no_grad():
         model.alpha.copy_(alpha_star)
         model.mu.copy_(mu_star)
-    
-    print("✅ Model configured with optimal parameters")
-    
-    # 3. Load test data
-    print("📊 Loading test data...")
-    test_logits, test_labels = load_test_data()
-    num_test_samples = len(test_labels)
-    print(f"✅ Loaded {num_test_samples} test samples")
-    
-    # 4. Get test predictions
-    print("🔮 Computing test predictions...")
-    eta_mix = get_mixture_posteriors(model, test_logits)
-    
-    # Ensure all tensors are on CPU for consistent computation
-    alpha_star_cpu = alpha_star.cpu()
-    mu_star_cpu = mu_star.cpu()
-    class_to_group_cpu = class_to_group.cpu()
-    
-    # Compute raw margins and predictions
-    margins_raw = compute_margin(eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
-    preds = (alpha_star_cpu[class_to_group_cpu] * eta_mix).argmax(dim=1)
-    
-    # 🔧 FIXED: Use per-group thresholds with GROUND-TRUTH groups (not predicted groups)
-    t_group = checkpoint.get('t_group', None)
-    if t_group is not None:
-        # Convert to tensor if it's a list and keep original list for display
-        if isinstance(t_group, list):
-            t_group_list = t_group
-            t_group = torch.tensor(t_group)
-        else:
-            t_group_list = t_group.tolist()
-        
-        # Use GROUND-TRUTH groups (class_to_group[true_labels]) instead of prediction groups  
-        y_groups = class_to_group_cpu[test_labels]  # Ground-truth groups
-        
-        # Per-sample threshold based on ground-truth group
-        thresholds_per_sample = torch.tensor([t_group[g].item() for g in y_groups])
-        accepted = margins_raw >= thresholds_per_sample
-        
-        print(f"✅ Using per-group thresholds with GROUND-TRUTH groups: {t_group_list}")
-        print(f"✅ Test coverage: {accepted.float().mean():.3f}")
-        
-        # Per-group coverage breakdown
-        for k in range(len(t_group_list)):
-            group_mask = (y_groups == k)
-            if group_mask.sum() > 0:
-                group_cov = accepted[group_mask].float().mean().item()
-                group_name = "head" if k == 0 else "tail" 
-                print(f"   📊 {group_name} (group {k}): coverage={group_cov:.3f}, threshold={t_group_list[k]:.3f}")
-            
-    else:
-        accepted = margins_raw >= plugin_threshold
-        print(f"✅ Using global threshold: {plugin_threshold:.3f}")
-        print(f"✅ Test coverage: {accepted.float().mean():.3f}")
-    
-    # 5. Calculate metrics
-    print("📈 Calculating metrics...")
-    results = {}
-    
-    # 5.1 RC Curve and AURC (using raw margins for fair comparison)
-    rc_df = generate_rc_curve(margins_raw, preds, test_labels, class_to_group_cpu, num_groups)
-    rc_df.to_csv(output_dir / 'rc_curve.csv', index=False)
-    
-    aurc_bal = calculate_aurc(rc_df, 'balanced_error')
-    aurc_wst = calculate_aurc(rc_df, 'worst_error')
-    results['aurc_balanced'] = aurc_bal
-    results['aurc_worst'] = aurc_wst
-    print(f"AURC (Balanced): {aurc_bal:.4f}, AURC (Worst): {aurc_wst:.4f}")
-    
-    # 5.2 RC Curve 0.2-1.0 range
-    rc_df_02 = generate_rc_curve_from_02(margins_raw, preds, test_labels, class_to_group_cpu, num_groups)
-    rc_df_02.to_csv(output_dir / 'rc_curve_02_10.csv', index=False)
-    
-    aurc_bal_02 = calculate_aurc_from_02(rc_df_02, 'balanced_error')
-    aurc_wst_02 = calculate_aurc_from_02(rc_df_02, 'worst_error')
-    results['aurc_balanced_02_10'] = aurc_bal_02
-    results['aurc_worst_02_10'] = aurc_wst_02
-    print(f"AURC 0.2-1.0 (Balanced): {aurc_bal_02:.4f}, AURC 0.2-1.0 (Worst): {aurc_wst_02:.4f}")
-    
-    # 5.3 Bootstrap CI for AURC
-    def aurc_metric_func(m, p, labels):
-        rc_df_boot = generate_rc_curve(m, p, labels, class_to_group_cpu, num_groups, num_points=51)
-        return calculate_aurc(rc_df_boot, 'balanced_error')
+    print("✅ Model configured with optimal parameters and gating ready")
 
-    mean_aurc, lower, upper = bootstrap_ci(
-        (margins_raw, preds, test_labels), aurc_metric_func, n_bootstraps=CONFIG['eval_params']['bootstrap_n']
-    )
-    results['aurc_balanced_bootstrap'] = {'mean': mean_aurc, '95ci_lower': lower, '95ci_upper': upper}
-    print(f"AURC Bootstrap 95% CI: [{lower:.4f}, {upper:.4f}]")
-    
-    # 5.4 Metrics at fixed coverage points (using raw margins)
-    results_at_coverage = {}
-    for cov_target in CONFIG['eval_params']['coverage_points']:
-        thr_cov = torch.quantile(margins_raw, 1.0 - cov_target)
-        accepted_mask = margins_raw >= thr_cov   # >= giúp bền vững khi có ties
-        
-        metrics = calculate_selective_errors(preds, test_labels, accepted_mask, class_to_group_cpu, num_groups)
-        results_at_coverage[f'cov_{cov_target}'] = metrics
-        print(f"Metrics @ {metrics['coverage']:.2f} coverage: "
-              f"Bal.Err={metrics['balanced_error']:.4f}, Worst.Err={metrics['worst_error']:.4f}")
-    results['metrics_at_coverage'] = results_at_coverage
-    
-    # 5.5 Plugin-specific metrics (at optimal threshold)
-    plugin_metrics = calculate_selective_errors(preds, test_labels, accepted, class_to_group_cpu, num_groups)
-    results['plugin_metrics_at_threshold'] = plugin_metrics
-    
-    # Better messaging based on threshold type used
-    t_group = checkpoint.get('t_group', None)
-    if t_group is not None:
-        # Convert to tensor if it's a list
-        if isinstance(t_group, list):
-            t_group_list = t_group
-            t_group = torch.tensor(t_group)
-        else:
-            t_group_list = t_group.tolist()
-            
-        print(f"Plugin metrics @ per-group thresholds {[f'{t:.3f}' for t in t_group_list]}: "
-              f"Coverage={plugin_metrics['coverage']:.3f}, "
-              f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
-    else:
-        print(f"Plugin metrics @ global threshold t*={plugin_threshold:.3f}: "
-              f"Coverage={plugin_metrics['coverage']:.3f}, "
-              f"Bal.Err={plugin_metrics['balanced_error']:.4f}, Worst.Err={plugin_metrics['worst_error']:.4f}")
-    
-    # 5.5a Detailed Group-wise Analysis
-    threshold_param = t_group if t_group is not None else plugin_threshold
-    analyze_group_performance(eta_mix, preds, test_labels, accepted,
-                             alpha_star_cpu, mu_star_cpu, threshold_param, class_to_group_cpu, num_groups)
-    
-    # 5.6 ECE
-    ece = calculate_ece(eta_mix, test_labels)
-    results['ece'] = ece
-    print(f"ECE: {ece:.4f}")
-    
-    # 5.7 Selective risk with different rejection costs (for comparison)
-    print("\nSelective Risk with different rejection costs:")
-    selective_risks = {}
-    for c_cost in [0.3, 0.5, 0.7]:
-        bal_risk = selective_risk_from_mask(preds, test_labels, accepted, c_cost,
-                                            class_to_group_cpu, num_groups, "balanced")
-        worst_risk = selective_risk_from_mask(preds, test_labels, accepted, c_cost,
-                                              class_to_group_cpu, num_groups, "worst")
-        selective_risks[f'cost_{c_cost}'] = {'balanced': bal_risk, 'worst': worst_risk}
-        print(f"  Cost c={c_cost:.2f}: Balanced={bal_risk:.4f}, Worst={worst_risk:.4f}")
-    results['selective_risks'] = selective_risks
-    
-    # 5.8 Comprehensive AURC Evaluation (following "Learning to Reject Meets Long-tail Learning" methodology)
+    # 3) Load AURC splits: tuneV + val_lt (validation), test_lt (test)
     print("\n" + "="*60)
     print("COMPREHENSIVE AURC EVALUATION")
     print("="*60)
+    (tunev_logits, tunev_labels, _), (val_lt_logits, val_lt_labels, _), (test_logits, test_labels, _) = load_aurc_splits_data()
     
-    # Load proper validation and test splits for AURC evaluation
-    # Use tuneV (S1) for threshold tuning and val_lt (S2) for final evaluation
-    # This ensures consistency with training methodology and preserves long-tail distribution
-    aurc_val_data, aurc_test_data = load_aurc_splits_data()
-    tunev_logits, tunev_labels, tunev_indices = aurc_val_data
-    val_lt_logits, val_lt_labels, val_lt_indices = aurc_test_data
-    
-    # Load alpha* and mu* from checkpoint for proper GSE margin computation
-    alpha_star_cpu = checkpoint['alpha'].cpu()
-    mu_star_cpu = checkpoint['mu'].cpu()
-    
-    # Get mixture posteriors for both splits
-    print("🔮 Computing mixture posteriors for AURC evaluation...")
+    print(f"📊 Validation set (tuneV + val_lt): {len(tunev_labels) + len(val_lt_labels)} samples")
+    print(f"📊 Test set (test_lt): {len(test_labels)} samples")
+    print("✅ Correct methodology: Optimize thresholds on (tuneV + val_lt), evaluate on test_lt")
+
+    # 4) Compute mixture posteriors and GSE margins/predictions
+    print("\n🔮 Computing mixture posteriors for all splits...")
     tunev_eta_mix = get_mixture_posteriors(model, tunev_logits)
     val_lt_eta_mix = get_mixture_posteriors(model, val_lt_logits)
+    test_eta_mix = get_mixture_posteriors(model, test_logits)
+
+    class_to_group_cpu = class_to_group.cpu()
+    alpha_star_cpu = alpha_star.cpu()
+    mu_star_cpu = mu_star.cpu()
+
+    # Compute margins for all splits
+    gse_margins_tunev = compute_margin(tunev_eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
+    gse_margins_val_lt = compute_margin(val_lt_eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
+    gse_margins_test = compute_margin(test_eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
+
+    # Compute predictions for all splits
+    preds_tunev = (alpha_star_cpu[class_to_group_cpu] * tunev_eta_mix).argmax(dim=1)
+    preds_val_lt = (alpha_star_cpu[class_to_group_cpu] * val_lt_eta_mix).argmax(dim=1)
+    preds_test = (alpha_star_cpu[class_to_group_cpu] * test_eta_mix).argmax(dim=1)
     
-    # Compute GSE margins as confidence scores
-    gse_margins_val = compute_margin(tunev_eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
-    gse_margins_test = compute_margin(val_lt_eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
+    # Combine tuneV + val_lt as validation set for threshold optimization
+    gse_margins_val_combined = torch.cat([gse_margins_tunev, gse_margins_val_lt])
+    preds_val_combined = torch.cat([preds_tunev, preds_val_lt])
+    labels_val_combined = torch.cat([tunev_labels, val_lt_labels])
     
-    # Compute predictions for both splits
-    preds_val = (alpha_star_cpu[class_to_group_cpu] * tunev_eta_mix).argmax(dim=1)
-    preds_test = (alpha_star_cpu[class_to_group_cpu] * val_lt_eta_mix).argmax(dim=1)
-    
-    print(f"📊 AURC Data splits - Validation (tuneV): {len(tunev_labels)}, Test (val_lt): {len(val_lt_labels)}")
-    print("✅ Using proper splits: tuneV for threshold tuning, val_lt for final evaluation")
-    print("✅ This ensures consistency with training methodology and preserves long-tail distribution")
-    
-    # Get cost values and metrics from config
+    print(f"✅ Combined validation set: {len(labels_val_combined)} samples")
+
+    # 5) Sweep cost values and compute AURC
     cost_values = CONFIG['aurc_eval']['cost_values']
     metrics = CONFIG['aurc_eval']['metrics']
-    
-    print(f"🎯 Cost grid: {len(cost_values)} values from {cost_values[0]:.1f} to {cost_values[-1]:.1f}")
-    
-    # Sweep costs for different metrics
+    print(f"\n🎯 Cost grid: {len(cost_values)} values from {cost_values[0]:.1f} to {cost_values[-1]:.1f}")
+
     aurc_results = {}
     all_rc_points = {}
-    
     for metric in metrics:
         print(f"\n🔄 Processing {metric} metric...")
+        print(f"   • Optimizing thresholds on validation (tuneV + val_lt): {len(labels_val_combined)} samples")
+        print(f"   • Evaluating on test (test_lt): {len(test_labels)} samples")
+        
         rc_points = sweep_cost_values_aurc(
-            gse_margins_val, preds_val, tunev_labels,
-            gse_margins_test, preds_test, val_lt_labels,
+            gse_margins_val_combined, preds_val_combined, labels_val_combined,  # Validation: tuneV + val_lt
+            gse_margins_test, preds_test, test_labels,                          # Test: test_lt
             class_to_group_cpu, num_groups, cost_values, metric
         )
-        
-        # Compute AURC for full range [0, 1]
         aurc_full = compute_aurc_from_points(rc_points, coverage_range='full')
-        aurc_results[metric] = aurc_full
-        
-        # Compute AURC for range [0.2, 1.0]
         aurc_02_10 = compute_aurc_from_points(rc_points, coverage_range='0.2-1.0')
+        aurc_results[metric] = aurc_full
         aurc_results[f'{metric}_02_10'] = aurc_02_10
-        
         all_rc_points[metric] = rc_points
-        
-        print(f"✅ {metric.upper()} AURC (0-1):     {aurc_full:.6f}")
-        print(f"✅ {metric.upper()} AURC (0.2-1):   {aurc_02_10:.6f}")
-    
-    # Save AURC results
-    results['aurc_results'] = aurc_results
-    
-    # Save detailed AURC data
-    aurc_results_df = []
+        print(f"   ✅ {metric.upper()} AURC (0-1):     {aurc_full:.6f}")
+        print(f"   ✅ {metric.upper()} AURC (0.2-1):   {aurc_02_10:.6f}")
+
+    # 6) Save results
+    output_dir.mkdir(parents=True, exist_ok=True)
+    aurc_rows = []
     for metric, rc_points in all_rc_points.items():
         for cost_c, coverage, risk in rc_points:
-            aurc_results_df.append({
-                'metric': metric,
-                'cost': cost_c,
-                'coverage': coverage,
-                'risk': risk
-            })
-    
-    aurc_df = pd.DataFrame(aurc_results_df)
-    aurc_df.to_csv(output_dir / 'aurc_detailed_results.csv', index=False)
-    
-    # Plot AURC curves
+            aurc_rows.append({'metric': metric, 'cost': cost_c, 'coverage': coverage, 'risk': risk})
+    pd.DataFrame(aurc_rows).to_csv(output_dir / 'aurc_detailed_results.csv', index=False)
+    with open(output_dir / 'aurc_summary.json', 'w') as f:
+        json.dump(aurc_results, f, indent=4)
     plot_aurc_curves(all_rc_points, aurc_results, output_dir / 'aurc_curves.png')
-    
+
+    # 7) Final summary
     print("\n" + "="*60)
     print("FINAL AURC RESULTS")
     print("="*60)
     print("\n📊 AURC (Full Range 0-1):")
     for metric in metrics:
-        aurc = aurc_results[metric]
-        print(f"   • {metric.upper():>12} AURC: {aurc:.6f}")
-    
+        print(f"   • {metric.upper():>12} AURC: {aurc_results[metric]:.6f}")
     print("\n📊 AURC (Practical Range 0.2-1):")
     for metric in metrics:
-        aurc_02 = aurc_results.get(f'{metric}_02_10', float('nan'))
-        print(f"   • {metric.upper():>12} AURC: {aurc_02:.6f}")
-    
+        print(f"   • {metric.upper():>12} AURC: {aurc_results.get(f'{metric}_02_10', float('nan')):.6f}")
     print("="*60)
     print("📝 Lower AURC is better (less area under risk-coverage curve)")
-    print("🎯 These results can be directly compared with 'Learning to Reject Meets Long-tail Learning'")
-    
-    # 6. Save results
-    with open(output_dir / 'metrics.json', 'w') as f:
-        json.dump(results, f, indent=4)
-    print(f"💾 Saved metrics to {output_dir / 'metrics.json'}")
-    
-    # 7. Plot RC curves
-    plt.figure(figsize=(12, 5))
-    
-    # Full range
-    plt.subplot(1, 2, 1)
-    plt.plot(rc_df['coverage'], rc_df['balanced_error'], label='Balanced Error', linewidth=2)
-    plt.plot(rc_df['coverage'], rc_df['worst_error'], label='Worst-Group Error', linestyle='--', linewidth=2)
-    plt.xlabel('Coverage')
-    plt.ylabel('Selective Risk (Error)')
-    plt.title('GSE-Balanced Plugin RC Curve (Full Range)')
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    
-    # Focused range
-    plt.subplot(1, 2, 2)
-    plt.plot(rc_df_02['coverage'], rc_df_02['balanced_error'], label='Balanced Error', linewidth=2)
-    plt.plot(rc_df_02['coverage'], rc_df_02['worst_error'], label='Worst-Group Error', linestyle='--', linewidth=2)
-    plt.xlabel('Coverage')
-    plt.ylabel('Selective Risk (Error)')
-    plt.title('GSE-Balanced Plugin RC Curve (0.2-1.0)')
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.xlim(0.2, 1.0)
-    
-    plt.tight_layout()
-    plt.savefig(output_dir / 'rc_curve_comparison.png', dpi=300, bbox_inches='tight')
-    plt.savefig(output_dir / 'rc_curve_comparison.pdf', bbox_inches='tight')
-    print(f"📊 Saved RC curve plots to {output_dir}")
-    
-    # Summary
-    print("\n" + "="*60)
-    print("GSE-BALANCED PLUGIN EVALUATION SUMMARY")
-    print("="*60)
-    print(f"Dataset: {CONFIG['dataset']['name']}")
-    print(f"Test samples: {num_test_samples}")
-    print(f"AURC Validation samples (tuneV): {len(tunev_labels)}")
-    print(f"AURC Test samples (val_lt): {len(val_lt_labels)}")
-    print(f"Optimal parameters: α*={alpha_star.cpu().tolist()}, μ*={mu_star.cpu().tolist()}")
-    
-    # Handle threshold display
-    t_group = checkpoint.get('t_group', None)
-    if t_group is not None:
-        if isinstance(t_group, list):
-            t_group_display = [f'{t:.3f}' for t in t_group]
-        else:
-            t_group_display = [f'{t:.3f}' for t in t_group.tolist()]
-        print(f"Per-group thresholds (fitted on S1): t* = {t_group_display}")
-    else:
-        print(f"Raw-margin threshold (fitted on S1): t* = {plugin_threshold:.3f}")
-    
-    print()
-    print("Key Results:")
-    print("📊 Traditional RC Metrics (using test_lt split for direct comparison):")
-    print(f"• AURC (Balanced): {aurc_bal:.4f}")
-    print(f"• AURC (Worst): {aurc_wst:.4f}") 
-    
-    print("\n🎯 Comprehensive AURC (using tuneV→val_lt methodology):")
-    print("   • Validation split: tuneV (for threshold tuning)")
-    print("   • Test split: val_lt (for final evaluation)")
-    print("   • Consistent with training methodology")
-    print("   • Preserves long-tail distribution")
-    for metric in ['standard', 'balanced', 'worst']:
-        if metric in aurc_results:
-            print(f"   • {metric.upper()} AURC: {aurc_results[metric]:.6f}")
-    
-    if t_group is not None:
-        print(f"\n• Plugin @ per-group thresholds: Coverage={plugin_metrics['coverage']:.3f}, "
-              f"Bal.Err={plugin_metrics['balanced_error']:.4f}")
-    else:
-        print(f"\n• Plugin @ t*={plugin_threshold:.3f}: Coverage={plugin_metrics['coverage']:.3f}, "
-              f"Bal.Err={plugin_metrics['balanced_error']:.4f}")
-    
-    print(f"• ECE: {ece:.4f}")
-    print("\n📁 AURC detailed results saved to: aurc_detailed_results.csv")
-    print("📊 AURC curves saved to: aurc_curves.png")
-    print("="*60)
+    print("🎯 Methodology: tuneV for threshold tuning → val_lt for evaluation")
 
 if __name__ == '__main__':
     main()
