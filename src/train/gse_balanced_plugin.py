@@ -22,7 +22,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 CONFIG = {
     'dataset': {
         'name': 'cifar100_lt_if100',
-        'splits_dir': './data/cifar100_lt_if100_splits',
+        'splits_dir': './data/cifar100_lt_if100_splits_fixed',  # Updated for fixed splits
         'num_classes': 100,
     },
     'grouping': {
@@ -30,7 +30,7 @@ CONFIG = {
     },
     'experts': {
         'names': ['ce_baseline', 'logitadjust_baseline', 'balsoftmax_baseline'],
-        'logits_dir': './outputs/logits/',
+        'logits_dir': './outputs/logits_fixed/',  # Updated for recomputed logits
     },
     'plugin_params': {
         'c': 0.2,  # rejection cost
@@ -516,23 +516,30 @@ def calculate_optimal_c_from_eta(eta, target_coverage=0.6):
     return optimal_c.item()
 
 def load_data_from_logits(config):
-    """Load pre-computed logits for tuneV (S1) and val_lt (S2) splits."""
-    logits_root = Path(config['experts']['logits_dir']) / config['dataset']['name']
+    """Load pre-computed logits for tunev (S1) and val (S2) splits."""
+    logits_dir = Path(config['experts']['logits_dir'])
     splits_dir = Path(config['dataset']['splits_dir'])
     expert_names = config['experts']['names']
     num_experts = len(expert_names)
     num_classes = config['dataset']['num_classes']
     
+    # Check if logits are in dataset subfolder or directly in logits_dir
+    dataset_name = config['dataset']['name']
+    logits_with_dataset = logits_dir / dataset_name
+    if logits_with_dataset.exists() and any(logits_with_dataset.iterdir()):
+        logits_root = logits_with_dataset
+    else:
+        logits_root = logits_dir
+    
     dataloaders = {}
     
-    # Base datasets
-    cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
+    # Base datasets - both splits are from test set (balanced)
     cifar_test_full = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
     
-    # Use tuneV (S1) and val_lt (S2) splits
+    # Use tunev (S1) and val (S2) splits - both from balanced test set
     splits_config = [
-        {'split_name': 'tuneV', 'base_dataset': cifar_train_full, 'indices_file': 'tuneV_indices.json'},
-        {'split_name': 'val_lt', 'base_dataset': cifar_test_full, 'indices_file': 'val_lt_indices.json'}
+        {'split_name': 'tunev', 'base_dataset': cifar_test_full, 'indices_file': 'tunev_indices.json'},
+        {'split_name': 'val', 'base_dataset': cifar_test_full, 'indices_file': 'val_indices.json'}
     ]
     
     for split in splits_config:
@@ -545,19 +552,26 @@ def load_data_from_logits(config):
             raise FileNotFoundError(f"Missing indices file: {indices_path}")
         indices = json.loads(indices_path.read_text())
 
-        # Stack expert logits
+        # Stack expert logits - support both .npz (new) and .pt (old) formats
         stacked_logits = torch.zeros(len(indices), num_experts, num_classes)
         for i, expert_name in enumerate(expert_names):
-            logits_path = logits_root / expert_name / f"{split_name}_logits.pt"
-            if not logits_path.exists():
-                raise FileNotFoundError(f"Missing logits file: {logits_path}")
-            stacked_logits[:, i, :] = torch.load(logits_path, map_location='cpu')
+            # Try .npz first (new format), then .pt (old format)
+            npz_path = logits_root / expert_name / f"{split_name}_logits.npz"
+            pt_path = logits_root / expert_name / f"{split_name}_logits.pt"
+            
+            if npz_path.exists():
+                data = np.load(npz_path)
+                stacked_logits[:, i, :] = torch.from_numpy(data['logits'])
+            elif pt_path.exists():
+                stacked_logits[:, i, :] = torch.load(pt_path, map_location='cpu')
+            else:
+                raise FileNotFoundError(f"Missing logits for {expert_name} at {npz_path} or {pt_path}")
 
         labels = torch.tensor(np.array(base_dataset.targets)[indices])
         dataset = TensorDataset(stacked_logits, labels)
         dataloaders[split_name] = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=4)
 
-    return dataloaders['tuneV'], dataloaders['val_lt']
+    return dataloaders['tunev'], dataloaders['val']
 
 def main():
     """Main GSE-Balanced plugin training."""

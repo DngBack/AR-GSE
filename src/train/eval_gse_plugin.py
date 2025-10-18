@@ -33,18 +33,19 @@ import torchvision
 # Custom modules
 from src.models.argse import AR_GSE
 from src.train.gse_balanced_plugin import compute_margin
+from src.metrics.reweighted_metrics import ReweightedMetrics  # Import reweighted metrics
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 CONFIG = {
     'dataset': {
         'name': 'cifar100_lt_if100',
-        'splits_dir': './data/cifar100_lt_if100_splits',
+        'splits_dir': './data/cifar100_lt_if100_splits_fixed',  # Updated to use fixed splits
         'num_classes': 100,
     },
     'experts': {
         'names': ['ce_baseline', 'logitadjust_baseline', 'balsoftmax_baseline'],
-        'logits_dir': './outputs/logits',
+        'logits_dir': './outputs/logits_fixed',  # Updated to use recomputed logits
     },
     'aurc_eval': {
         'cost_values': np.linspace(0.0, 1.0, 81),  # 81 cost values from 0 to 1.0
@@ -62,13 +63,19 @@ CONFIG = {
 def load_aurc_splits_data():
     """
     Load all three splits for proper AURC evaluation:
-      - tuneV + val_lt: combined as validation set for threshold optimization
-      - test_lt: held-out test set for final evaluation
+      - tunev: tuning/validation split for threshold optimization
+      - val: validation split for threshold optimization  
+      - test: held-out test set for final evaluation
     
     Returns:
-        Tuple of (tunev_data, val_lt_data, test_data) where each is (logits, labels, indices)
+        Tuple of (tunev_data, val_data, test_data) where each is (logits, labels, indices)
     """
-    logits_root = Path(CONFIG['experts']['logits_dir']) / CONFIG['dataset']['name']
+    logits_root = Path(CONFIG['experts']['logits_dir'])
+    # Check if dataset subdirectory exists
+    dataset_subdir = logits_root / CONFIG['dataset']['name']
+    if dataset_subdir.exists():
+        logits_root = dataset_subdir
+    
     splits_dir = Path(CONFIG['dataset']['splits_dir'])
     num_experts = len(CONFIG['experts']['names'])
     num_classes = CONFIG['dataset']['num_classes']
@@ -76,55 +83,56 @@ def load_aurc_splits_data():
     # Load splits indices
     print("📂 Loading AURC evaluation splits...")
     
-    # tuneV (from train set)
-    with open(splits_dir / 'tuneV_indices.json', 'r') as f:
+    # tunev (from test set - balanced)
+    with open(splits_dir / 'tunev_indices.json', 'r') as f:
         tunev_indices = json.load(f)
     
-    # val_lt (from test set)
-    with open(splits_dir / 'val_lt_indices.json', 'r') as f:
-        val_lt_indices = json.load(f)
+    # val (from test set - balanced)
+    with open(splits_dir / 'val_indices.json', 'r') as f:
+        val_indices = json.load(f)
     
-    # test_lt (from test set)
-    with open(splits_dir / 'test_lt_indices.json', 'r') as f:
-        test_lt_indices = json.load(f)
+    # test (from test set - balanced)
+    with open(splits_dir / 'test_indices.json', 'r') as f:
+        test_indices = json.load(f)
     
-    print(f"✅ tuneV: {len(tunev_indices)} samples (train set)")
-    print(f"✅ val_lt: {len(val_lt_indices)} samples (test set)")
-    print(f"✅ test_lt: {len(test_lt_indices)} samples (test set)")
-    print(f"✅ Validation (tuneV + val_lt): {len(tunev_indices) + len(val_lt_indices)} samples")
+    print(f"✅ tunev: {len(tunev_indices)} samples (test set - balanced)")
+    print(f"✅ val: {len(val_indices)} samples (test set - balanced)")
+    print(f"✅ test: {len(test_indices)} samples (test set - balanced)")
+    print(f"✅ Validation (tunev + val): {len(tunev_indices) + len(val_indices)} samples")
     
-    # Load datasets
-    cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
+    # Load datasets - all splits come from test set now (balanced)
     cifar_test_full = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
     
-    # Load tuneV data (from train set)
-    tunev_logits = torch.zeros(len(tunev_indices), num_experts, num_classes)
-    for i, expert_name in enumerate(CONFIG['experts']['names']):
-        logits_path = logits_root / expert_name / "tuneV_logits.pt"
-        if not logits_path.exists():
-            raise FileNotFoundError(f"Missing logits: {logits_path}")
-        tunev_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
-    tunev_labels = torch.tensor(np.array(cifar_train_full.targets)[tunev_indices])
+    # Helper function to load logits (supports both .npz and .pt)
+    def load_expert_logits(split_name, indices):
+        logits = torch.zeros(len(indices), num_experts, num_classes)
+        for i, expert_name in enumerate(CONFIG['experts']['names']):
+            # Try .npz first (new format), then .pt (old format)
+            npz_path = logits_root / expert_name / f"{split_name}_logits.npz"
+            pt_path = logits_root / expert_name / f"{split_name}_logits.pt"
+            
+            if npz_path.exists():
+                data = np.load(npz_path)
+                logits[:, i, :] = torch.from_numpy(data['logits'])
+            elif pt_path.exists():
+                logits[:, i, :] = torch.load(pt_path, map_location='cpu', weights_only=False)
+            else:
+                raise FileNotFoundError(f"Missing logits for {expert_name} split {split_name}: {npz_path} or {pt_path}")
+        return logits
     
-    # Load val_lt data (from test set)
-    val_lt_logits = torch.zeros(len(val_lt_indices), num_experts, num_classes)
-    for i, expert_name in enumerate(CONFIG['experts']['names']):
-        logits_path = logits_root / expert_name / "val_lt_logits.pt"
-        if not logits_path.exists():
-            raise FileNotFoundError(f"Missing logits: {logits_path}")
-        val_lt_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
-    val_lt_labels = torch.tensor(np.array(cifar_test_full.targets)[val_lt_indices])
+    # Load tunev data
+    tunev_logits = load_expert_logits('tunev', tunev_indices)
+    tunev_labels = torch.tensor(np.array(cifar_test_full.targets)[tunev_indices])
     
-    # Load test_lt data (from test set)
-    test_lt_logits = torch.zeros(len(test_lt_indices), num_experts, num_classes)
-    for i, expert_name in enumerate(CONFIG['experts']['names']):
-        logits_path = logits_root / expert_name / "test_lt_logits.pt"
-        if not logits_path.exists():
-            raise FileNotFoundError(f"Missing logits: {logits_path}")
-        test_lt_logits[:, i, :] = torch.load(logits_path, map_location='cpu', weights_only=False)
-    test_lt_labels = torch.tensor(np.array(cifar_test_full.targets)[test_lt_indices])
+    # Load val data
+    val_logits = load_expert_logits('val', val_indices)
+    val_labels = torch.tensor(np.array(cifar_test_full.targets)[val_indices])
     
-    return (tunev_logits, tunev_labels, tunev_indices), (val_lt_logits, val_lt_labels, val_lt_indices), (test_lt_logits, test_lt_labels, test_lt_indices)
+    # Load test data
+    test_logits = load_expert_logits('test', test_indices)
+    test_labels = torch.tensor(np.array(cifar_test_full.targets)[test_indices])
+    
+    return (tunev_logits, tunev_labels, tunev_indices), (val_logits, val_labels, val_indices), (test_logits, test_labels, test_indices)
 
 def get_mixture_posteriors(model, logits):
     """Compute mixture posteriors η̃(x) from expert logits."""
@@ -142,15 +150,42 @@ def get_mixture_posteriors(model, logits):
 #############################################
 
 
-def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K, metric_type="balanced"):
-    """Compute group-aware risk for AURC evaluation on accepted samples."""
+def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K, 
+                               class_weights=None, metric_type="balanced"):
+    """
+    Compute group-aware risk for AURC evaluation on accepted samples.
+    
+    Args:
+        preds: [N] predictions
+        labels: [N] true labels  
+        accepted_mask: [N] boolean mask for accepted samples
+        class_to_group: [C] class to group mapping
+        K: number of groups
+        class_weights: dict mapping class_id -> weight (for reweighting), or None
+        metric_type: 'standard', 'balanced', or 'worst'
+        
+    Returns:
+        risk: scalar risk value (error rate)
+    """
     if accepted_mask.sum() == 0:
         return 1.0
+    
     y = labels
     g = class_to_group[y]
+    
     if metric_type == 'standard':
         correct = (preds[accepted_mask] == y[accepted_mask])
-        return 1.0 - correct.float().mean().item()
+        
+        # Apply reweighting if class_weights provided
+        if class_weights is not None:
+            weights = torch.tensor([class_weights[int(c)] for c in y[accepted_mask]], 
+                                  dtype=torch.float32)
+            weighted_correct = (correct.float() * weights).sum()
+            total_weight = weights.sum()
+            return 1.0 - (weighted_correct / total_weight).item()
+        else:
+            return 1.0 - correct.float().mean().item()
+    
     group_errors = []
     for k in range(K):
         group_mask = (g == k)
@@ -159,7 +194,17 @@ def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K,
             group_errors.append(1.0)
         else:
             group_correct = (preds[group_accepted] == y[group_accepted])
-            group_error = 1.0 - group_correct.float().mean().item()
+            
+            # Apply reweighting if class_weights provided
+            if class_weights is not None:
+                weights = torch.tensor([class_weights[int(c)] for c in y[group_accepted]], 
+                                      dtype=torch.float32)
+                weighted_correct = (group_correct.float() * weights).sum()
+                total_weight = weights.sum()
+                group_error = 1.0 - (weighted_correct / total_weight).item()
+            else:
+                group_error = 1.0 - group_correct.float().mean().item()
+            
             group_errors.append(group_error)
     if metric_type == 'balanced':
         return float(np.mean(group_errors))
@@ -169,7 +214,7 @@ def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K,
         raise ValueError(f"Unknown metric type: {metric_type}")
 
 def find_optimal_threshold_for_cost(confidence_scores, preds, labels, class_to_group, K, 
-                                   cost_c, metric_type="balanced"):
+                                   cost_c, class_weights=None, metric_type="balanced"):
     """
     Find optimal threshold that minimizes: risk + c * (1 - coverage)
     
@@ -180,6 +225,7 @@ def find_optimal_threshold_for_cost(confidence_scores, preds, labels, class_to_g
         class_to_group: [C] class to group mapping
         K: number of groups
         cost_c: rejection cost
+        class_weights: dict mapping class_id -> weight (for reweighting), or None
         metric_type: risk metric type
         
     Returns:
@@ -198,7 +244,8 @@ def find_optimal_threshold_for_cost(confidence_scores, preds, labels, class_to_g
     for threshold in thresholds:
         accepted = confidence_scores >= threshold
         coverage = accepted.float().mean().item()
-        risk = compute_group_risk_for_aurc(preds, labels, accepted, class_to_group, K, metric_type)
+        risk = compute_group_risk_for_aurc(preds, labels, accepted, class_to_group, K, 
+                                          class_weights, metric_type)
         
         # Objective: risk + c * rejection_rate
         objective = risk + cost_c * (1.0 - coverage)
@@ -211,7 +258,7 @@ def find_optimal_threshold_for_cost(confidence_scores, preds, labels, class_to_g
 
 def sweep_cost_values_aurc(confidence_scores_val, preds_val, labels_val, 
                           confidence_scores_test, preds_test, labels_test,
-                          class_to_group, K, cost_values, metric_type="balanced"):
+                          class_to_group, K, cost_values, class_weights=None, metric_type="balanced"):
     """
     Sweep cost values and return (cost, coverage, risk) points on test set.
     
@@ -225,6 +272,7 @@ def sweep_cost_values_aurc(confidence_scores_val, preds_val, labels_val,
         class_to_group: [C] class to group mapping
         K: number of groups
         cost_values: array of cost values to sweep
+        class_weights: dict mapping class_id -> weight (for reweighting), or None
         metric_type: risk metric type
         
     Returns:
@@ -237,14 +285,15 @@ def sweep_cost_values_aurc(confidence_scores_val, preds_val, labels_val,
     for i, cost_c in enumerate(cost_values):
         # Find optimal threshold on validation
         optimal_threshold = find_optimal_threshold_for_cost(
-            confidence_scores_val, preds_val, labels_val, class_to_group, K, cost_c, metric_type
+            confidence_scores_val, preds_val, labels_val, class_to_group, K, cost_c, 
+            class_weights, metric_type
         )
         
         # Apply to test set
         accepted_test = confidence_scores_test >= optimal_threshold
         coverage_test = accepted_test.float().mean().item()
         risk_test = compute_group_risk_for_aurc(preds_test, labels_test, accepted_test, 
-                                               class_to_group, K, metric_type)
+                                               class_to_group, K, class_weights, metric_type)
         
         rc_points.append((cost_c, coverage_test, risk_test))
         
@@ -398,11 +447,24 @@ def main():
     torch.manual_seed(CONFIG['seed'])
     np.random.seed(CONFIG['seed'])
 
-    print("=== Comprehensive AURC Evaluation (tuneV → val_lt) ===")
+    print("=== Comprehensive AURC Evaluation (Reweighted for Long-Tail) ===")
 
     # Output directory
     output_dir = Path(CONFIG['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Load class weights for reweighting
+    class_weights_path = Path(CONFIG['dataset']['splits_dir']) / 'class_weights.json'
+    if class_weights_path.exists():
+        with open(class_weights_path, 'r') as f:
+            class_weights_list = json.load(f)
+        # Convert list to dict: class_id -> weight
+        class_weights = {i: w for i, w in enumerate(class_weights_list)}
+        print(f"✅ Loaded class weights from {class_weights_path}")
+        print(f"   Sample weights: class 0={class_weights[0]:.4f}, class 99={class_weights[99]:.4f}")
+    else:
+        class_weights = None
+        print("⚠️  No class_weights.json found - using uniform weighting")
 
     # 1) Load plugin checkpoint (α*, μ*, class_to_group, gating)
     plugin_ckpt_path = Path(CONFIG['plugin_checkpoint'])
@@ -499,14 +561,14 @@ def main():
     aurc_results = {}
     all_rc_points = {}
     for metric in metrics:
-        print(f"\n🔄 Processing {metric} metric...")
-        print(f"   • Optimizing thresholds on validation (tuneV + val_lt): {len(labels_val_combined)} samples")
-        print(f"   • Evaluating on test (test_lt): {len(test_labels)} samples")
+        print(f"\n🔄 Processing {metric} metric {'(REWEIGHTED)' if class_weights else ''}...")
+        print(f"   • Optimizing thresholds on validation (tunev + val): {len(labels_val_combined)} samples")
+        print(f"   • Evaluating on test: {len(test_labels)} samples")
         
         rc_points = sweep_cost_values_aurc(
-            gse_margins_val_combined, preds_val_combined, labels_val_combined,  # Validation: tuneV + val_lt
-            gse_margins_test, preds_test, test_labels,                          # Test: test_lt
-            class_to_group_cpu, num_groups, cost_values, metric
+            gse_margins_val_combined, preds_val_combined, labels_val_combined,  # Validation
+            gse_margins_test, preds_test, test_labels,                          # Test
+            class_to_group_cpu, num_groups, cost_values, class_weights, metric  # Pass class_weights
         )
         aurc_full = compute_aurc_from_points(rc_points, coverage_range='full')
         aurc_02_10 = compute_aurc_from_points(rc_points, coverage_range='0.2-1.0')
@@ -529,7 +591,7 @@ def main():
 
     # 7) Final summary
     print("\n" + "="*60)
-    print("FINAL AURC RESULTS")
+    print("FINAL AURC RESULTS (REWEIGHTED FOR LONG-TAIL)" if class_weights else "FINAL AURC RESULTS")
     print("="*60)
     print("\n📊 AURC (Full Range 0-1):")
     for metric in metrics:
@@ -538,8 +600,10 @@ def main():
     for metric in metrics:
         print(f"   • {metric.upper():>12} AURC: {aurc_results.get(f'{metric}_02_10', float('nan')):.6f}")
     print("="*60)
+    if class_weights:
+        print("✅ Metrics reweighted by train class distribution (proper long-tail evaluation)")
     print("📝 Lower AURC is better (less area under risk-coverage curve)")
-    print("🎯 Methodology: tuneV for threshold tuning → val_lt for evaluation")
+    print("🎯 Methodology: Optimize thresholds on (tunev + val), evaluate on test")
 
 if __name__ == '__main__':
     main()
