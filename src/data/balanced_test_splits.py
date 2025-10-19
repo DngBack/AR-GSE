@@ -121,6 +121,99 @@ def create_longtail_train(cifar_train_dataset, imb_factor: float = 100, seed: in
     return train_indices, train_targets, actual_counts
 
 
+def split_train_for_expert_and_gating(
+    train_indices: List[int],
+    train_targets: List[int],
+    train_counts: List[int],
+    expert_ratio: float = 0.9,
+    seed: int = 42
+) -> Tuple[List[int], List[int], List[int], List[int], List[int], List[int]]:
+    """
+    Split long-tail training set into expert training (90%) and gating training (10%).
+    
+    CRITICAL: Maintains the same imbalance ratio in both splits!
+    
+    Args:
+        train_indices: Original training indices
+        train_targets: Original training targets
+        train_counts: Samples per class in original training set
+        expert_ratio: Ratio for expert training (default: 0.9 for 90%)
+        seed: Random seed
+        
+    Returns:
+        (expert_indices, expert_targets, expert_counts, 
+         gating_indices, gating_targets, gating_counts)
+    """
+    print(f"\nSplitting training set ({expert_ratio*100:.0f}% expert / {(1-expert_ratio)*100:.0f}% gating)...")
+    
+    np.random.seed(seed)
+    num_classes = 100
+    
+    # Group indices by class
+    indices_by_class = {cls: [] for cls in range(num_classes)}
+    for idx, target in zip(train_indices, train_targets):
+        indices_by_class[target].append(idx)
+    
+    expert_indices = []
+    gating_indices = []
+    expert_counts = []
+    gating_counts = []
+    
+    for cls in range(num_classes):
+        cls_indices = np.array(indices_by_class[cls])
+        total_cls = len(cls_indices)
+        
+        # Calculate split sizes (maintain proportions)
+        expert_size = int(total_cls * expert_ratio)
+        gating_size = total_cls - expert_size
+        
+        # Shuffle and split
+        np.random.shuffle(cls_indices)
+        expert_cls_indices = cls_indices[:expert_size]
+        gating_cls_indices = cls_indices[expert_size:]
+        
+        expert_indices.extend(expert_cls_indices.tolist())
+        gating_indices.extend(gating_cls_indices.tolist())
+        expert_counts.append(expert_size)
+        gating_counts.append(gating_size)
+    
+    # Get targets
+    expert_targets = [train_targets[train_indices.index(idx)] for idx in expert_indices]
+    gating_targets = [train_targets[train_indices.index(idx)] for idx in gating_indices]
+    
+    # Verify splits
+    print(f"\n  ✅ Expert split:")
+    print(f"    Total: {len(expert_indices):,} samples")
+    print(f"    Head class (0): {expert_counts[0]} samples")
+    print(f"    Tail class (99): {expert_counts[-1]} samples")
+    print(f"    Imbalance Factor: {expert_counts[0] / max(expert_counts[-1], 1):.1f}")
+    
+    print(f"\n  ✅ Gating split:")
+    print(f"    Total: {len(gating_indices):,} samples")
+    print(f"    Head class (0): {gating_counts[0]} samples")
+    print(f"    Tail class (99): {gating_counts[-1]} samples")
+    print(f"    Imbalance Factor: {gating_counts[0] / max(gating_counts[-1], 1):.1f}")
+    
+    # Verify no overlap
+    expert_set = set(expert_indices)
+    gating_set = set(gating_indices)
+    assert len(expert_set & gating_set) == 0, "Expert and Gating splits overlap!"
+    print("\n  ✅ No overlap between expert and gating splits")
+    
+    # Verify same imbalance ratio
+    original_ratio = train_counts[0] / train_counts[-1]
+    expert_ratio_actual = expert_counts[0] / max(expert_counts[-1], 1)
+    gating_ratio_actual = gating_counts[0] / max(gating_counts[-1], 1)
+    
+    print(f"\n  ✅ Imbalance ratio preserved:")
+    print(f"    Original: {original_ratio:.1f}")
+    print(f"    Expert:   {expert_ratio_actual:.1f}")
+    print(f"    Gating:   {gating_ratio_actual:.1f}")
+    
+    return (expert_indices, expert_targets, expert_counts,
+            gating_indices, gating_targets, gating_counts)
+
+
 def split_balanced_test_8_1_1(
     cifar_test_dataset,
     seed: int = 42
@@ -304,13 +397,16 @@ def save_splits_to_json(splits_dict: Dict, output_dir: str):
 def create_cifar100_lt_balanced_test_splits(
     imb_factor: float = 100,
     output_dir: str = "data/cifar100_lt_if100_splits_fixed",
-    seed: int = 42
+    seed: int = 42,
+    split_train_for_experts_and_gating: bool = True,
+    expert_ratio: float = 0.9
 ):
     """
     Create CIFAR-100-LT dataset with balanced test splits (8:1:1).
     
     This function creates:
     1. Long-tail training set (exponential distribution, IF=100)
+       - Option to split into expert (90%) and gating (10%) with same imbalance
     2. Balanced test set (80 per class = 8,000 total)
     3. Balanced validation set (10 per class = 1,000 total)
     4. Balanced tuneV set (10 per class = 1,000 total)
@@ -323,22 +419,28 @@ def create_cifar100_lt_balanced_test_splits(
         imb_factor: Imbalance factor for training (default: 100)
         output_dir: Output directory for splits
         seed: Random seed for reproducibility
+        split_train_for_experts_and_gating: Whether to split train into expert/gating (default: True)
+        expert_ratio: Ratio for expert training when splitting (default: 0.9 = 90%)
         
     Returns:
         Tuple of (datasets_dict, splits_dict, class_weights)
     """
-    print("="*60)
-    print("CREATING CIFAR-100-LT WITH BALANCED TEST SPLITS (8:1:1)")
-    print("="*60)
+    print("="*80)
+    print("CREATING CIFAR-100-LT WITH BALANCED TEST SPLITS")
+    print("="*80)
     print(f"\nConfiguration:")
     print(f"  Imbalance Factor: {imb_factor}")
     print(f"  Output Directory: {output_dir}")
     print(f"  Random Seed: {seed}")
+    if split_train_for_experts_and_gating:
+        print(f"  Train Split: {expert_ratio*100:.0f}% Expert / {(1-expert_ratio)*100:.0f}% Gating")
+    else:
+        print(f"  Train Split: Single unified training set")
     
     # Load original CIFAR-100
-    print("\n" + "="*60)
+    print("\n" + "="*80)
     print("STEP 1: Loading CIFAR-100 datasets...")
-    print("="*60)
+    print("="*80)
     cifar_train = torchvision.datasets.CIFAR100(
         root='data', train=True, download=True, transform=None
     )
@@ -349,40 +451,56 @@ def create_cifar100_lt_balanced_test_splits(
     print(f"  ✓ Test:  {len(cifar_test):,} samples")
     
     # Create long-tail training set
-    print("\n" + "="*60)
+    print("\n" + "="*80)
     print("STEP 2: Creating long-tail training set...")
-    print("="*60)
+    print("="*80)
     train_indices, train_targets, train_counts = create_longtail_train(
         cifar_train, imb_factor, seed
     )
     
+    # Split train into expert and gating if requested
+    expert_indices, expert_targets, expert_counts = None, None, None
+    gating_indices, gating_targets, gating_counts = None, None, None
+    
+    if split_train_for_experts_and_gating:
+        print("\n" + "="*80)
+        print("STEP 3: Splitting train set (Expert vs Gating)...")
+        print("="*80)
+        (expert_indices, expert_targets, expert_counts,
+         gating_indices, gating_targets, gating_counts) = split_train_for_expert_and_gating(
+            train_indices, train_targets, train_counts, expert_ratio, seed
+        )
+    
     # Split balanced test set (8:1:1)
-    print("\n" + "="*60)
-    print("STEP 3: Splitting test set (8:1:1)...")
-    print("="*60)
+    print("\n" + "="*80)
+    print(f"STEP {4 if split_train_for_experts_and_gating else 3}: Splitting test set (8:1:1)...")
+    print("="*80)
     (test_indices, test_targets, 
      val_indices, val_targets, 
      tunev_indices, tunev_targets) = split_balanced_test_8_1_1(cifar_test, seed)
     
     # Compute class weights for reweighting
-    print("\n" + "="*60)
-    print("STEP 4: Computing class weights...")
-    print("="*60)
+    print("\n" + "="*80)
+    print(f"STEP {5 if split_train_for_experts_and_gating else 4}: Computing class weights...")
+    print("="*80)
     class_weights = compute_class_weights(train_counts)
     
     # Analyze distributions
-    print("\n" + "="*60)
-    print("STEP 5: Analyzing distributions...")
-    print("="*60)
-    analyze_distribution(train_indices, train_targets, "Train")
+    print("\n" + "="*80)
+    print(f"STEP {6 if split_train_for_experts_and_gating else 5}: Analyzing distributions...")
+    print("="*80)
+    analyze_distribution(train_indices, train_targets, "Train (Original)")
+    if split_train_for_experts_and_gating:
+        analyze_distribution(expert_indices, expert_targets, "Train Expert")
+        analyze_distribution(gating_indices, gating_targets, "Train Gating")
     analyze_distribution(test_indices, test_targets, "Test")
     analyze_distribution(val_indices, val_targets, "Val")
     analyze_distribution(tunev_indices, tunev_targets, "TuneV")
     
     # Save all splits
-    print("\n" + "="*60)
-    print("STEP 6: Saving splits...")
-    print("="*60)
+    print("\n" + "="*80)
+    print(f"STEP {7 if split_train_for_experts_and_gating else 6}: Saving splits...")
+    print("="*80)
     splits = {
         'train_indices': train_indices,
         'test_indices': test_indices,
@@ -392,12 +510,18 @@ def create_cifar100_lt_balanced_test_splits(
         'train_class_counts': train_counts
     }
     
+    if split_train_for_experts_and_gating:
+        splits['expert_indices'] = expert_indices
+        splits['gating_indices'] = gating_indices
+        splits['expert_class_counts'] = expert_counts
+        splits['gating_class_counts'] = gating_counts
+    
     save_splits_to_json(splits, output_dir)
     
     # Create dataset objects
-    print("\n" + "="*60)
-    print("STEP 7: Creating dataset objects...")
-    print("="*60)
+    print("\n" + "="*80)
+    print(f"STEP {8 if split_train_for_experts_and_gating else 7}: Creating dataset objects...")
+    print("="*80)
     train_transform, eval_transform = get_cifar100_transforms()
     
     datasets = {
@@ -407,21 +531,35 @@ def create_cifar100_lt_balanced_test_splits(
         'tunev': CIFAR100LTDataset(cifar_test, tunev_indices, eval_transform)
     }
     
+    if split_train_for_experts_and_gating:
+        datasets['expert'] = CIFAR100LTDataset(cifar_train, expert_indices, train_transform)
+        datasets['gating'] = CIFAR100LTDataset(cifar_train, gating_indices, train_transform)
+    
     for name, dataset in datasets.items():
         print(f"  ✓ {name}: {len(dataset):,} samples")
     
     # Final summary
-    print("\n" + "="*60)
+    print("\n" + "="*80)
     print("✅ DATASET CREATION COMPLETED SUCCESSFULLY!")
-    print("="*60)
+    print("="*80)
     print("\n📊 Summary:")
-    print(f"  Train:  {len(datasets['train']):,} samples (long-tail, IF={imb_factor})")
+    if split_train_for_experts_and_gating:
+        print(f"  Train (Original): {len(datasets['train']):,} samples (long-tail, IF={imb_factor})")
+        print(f"  Train (Expert):   {len(datasets['expert']):,} samples (long-tail, IF={imb_factor})")
+        print(f"  Train (Gating):   {len(datasets['gating']):,} samples (long-tail, IF={imb_factor})")
+    else:
+        print(f"  Train:  {len(datasets['train']):,} samples (long-tail, IF={imb_factor})")
     print(f"  Test:   {len(datasets['test']):,} samples (balanced)")
     print(f"  Val:    {len(datasets['val']):,} samples (balanced)")
     print(f"  TuneV:  {len(datasets['tunev']):,} samples (balanced)")
     
     print("\n📁 Files saved:")
     print(f"  {output_dir}/train_indices.json")
+    if split_train_for_experts_and_gating:
+        print(f"  {output_dir}/expert_indices.json")
+        print(f"  {output_dir}/gating_indices.json")
+        print(f"  {output_dir}/expert_class_counts.json")
+        print(f"  {output_dir}/gating_class_counts.json")
     print(f"  {output_dir}/test_indices.json")
     print(f"  {output_dir}/val_indices.json")
     print(f"  {output_dir}/tunev_indices.json")
@@ -430,6 +568,8 @@ def create_cifar100_lt_balanced_test_splits(
     
     print("\n⚠️  IMPORTANT:")
     print("  - Test/Val/TuneV are BALANCED (no duplication)")
+    if split_train_for_experts_and_gating:
+        print("  - Expert/Gating maintain same imbalance ratio")
     print("  - Use class_weights.json for reweighted metrics")
     print("  - No data leakage between splits")
     

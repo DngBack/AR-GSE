@@ -58,16 +58,34 @@ class CIFAR100LTDataModule:
             
         return indices
         
-    def setup_datasets(self):
-        """Setup all datasets from saved splits."""
+    def setup_datasets(self, use_expert_split: bool = False, use_gating_split: bool = False):
+        """
+        Setup all datasets from saved splits.
+        
+        Args:
+            use_expert_split: If True, use expert split instead of full train
+            use_gating_split: If True, use gating split instead of full train
+        """
         print("Setting up CIFAR-100-LT datasets...")
         
-        # Define split mappings (removed val_small and calib)
+        # Determine which training split to use
+        if use_expert_split and use_gating_split:
+            raise ValueError("Cannot use both expert and gating splits simultaneously")
+        
+        train_split_key = 'train'  # Default
+        if use_expert_split:
+            train_split_key = 'expert'
+            print("  Using EXPERT split for training (90% of train)")
+        elif use_gating_split:
+            train_split_key = 'gating'
+            print("  Using GATING split for training (10% of train)")
+        
+        # Define split mappings
         splits = {
-            'train': ('train', self.cifar_train, self.train_transform),
-            'val': ('val_lt', self.cifar_test, self.eval_transform),
-            'test': ('test_lt', self.cifar_test, self.eval_transform),
-            'tunev': ('tuneV', self.cifar_test, self.eval_transform)
+            'train': (train_split_key, self.cifar_train, self.train_transform),
+            'val': ('val', self.cifar_test, self.eval_transform),
+            'test': ('test', self.cifar_test, self.eval_transform),
+            'tunev': ('tunev', self.cifar_test, self.eval_transform)
         }
 
         for split_key, (indices_key, base_dataset, transform) in splits.items():
@@ -197,20 +215,32 @@ def get_cifar100_lt_dataloaders(
 
 def get_expert_training_dataloaders(
     batch_size: int = 128,
-    num_workers: int = 4
+    num_workers: int = 4,
+    use_expert_split: bool = True,
+    splits_dir: str = "data/cifar100_lt_if100_splits_fixed"
 ) -> Tuple[DataLoader, DataLoader]:
     """
-    Get dataloaders for expert training (train + val_lt for realistic validation).
+    Get dataloaders for expert training.
+    
+    Args:
+        batch_size: Batch size for training
+        num_workers: Number of worker threads
+        use_expert_split: If True, use expert split (90% of train), else use full train
+        splits_dir: Directory containing the split files
     
     Returns:
         Tuple of (train_loader, val_loader) 
     """
     
-    data_module = CIFAR100LTDataModule(batch_size=batch_size, num_workers=num_workers)
-    data_module.setup_datasets()
+    data_module = CIFAR100LTDataModule(
+        batch_size=batch_size, 
+        num_workers=num_workers,
+        splits_dir=splits_dir
+    )
+    data_module.setup_datasets(use_expert_split=use_expert_split)
     
     train_loader = data_module.get_dataloader('train')
-    val_loader = data_module.get_dataloader('val')  # Use val_lt for realistic validation
+    val_loader = data_module.get_dataloader('val')  # Balanced val split
     
     return train_loader, val_loader
 

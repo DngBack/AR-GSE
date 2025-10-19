@@ -16,6 +16,10 @@ from src.train.gse_balanced_plugin import main, CONFIG
 if __name__ == '__main__':
     print("🚀 GSE Worst-Group EG-Outer with ALL Improvements")
     print("=" * 60)
+    print("Configuration:")
+    print(f"  Splits dir: {CONFIG['dataset']['splits_dir']}")
+    print(f"  Logits dir: {CONFIG['experts']['logits_dir']}")
+    print()
     print("Improvements applied:")
     print("✅ Anti-collapse β (floor=0.05, momentum=0.25)")
     print("✅ Reduced EG step size (xi=0.2)")
@@ -25,6 +29,7 @@ if __name__ == '__main__':
     print("✅ More aggressive tail coverage (0.42 vs 0.58)")
     print("✅ Blended alpha updates (joint + conditional)")
     print("✅ Adaptive lambda grid expansion")
+    print("✅ Reweighted metrics for balanced data")
     print("=" * 60)
     
     # Apply all improvements to CONFIG

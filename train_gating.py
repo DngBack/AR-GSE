@@ -64,6 +64,20 @@ def parse_arguments():
         help='Show configuration without training'
     )
     
+    parser.add_argument(
+        '--logits-dir',
+        type=str,
+        default='./outputs/logits/cifar100_lt_if100',
+        help='Directory containing expert logits (default: ./outputs/logits/cifar100_lt_if100)'
+    )
+    
+    parser.add_argument(
+        '--splits-dir',
+        type=str,
+        default='./data/cifar100_lt_if100_splits_fixed',
+        help='Directory containing data splits (default: ./data/cifar100_lt_if100_splits_fixed)'
+    )
+    
     return parser.parse_args()
 
 def setup_gating_environment(args):
@@ -97,19 +111,26 @@ def run_gating_training(args):
     """Run the gating training with specified mode."""
     if args.dry_run:
         print(f"🔍 [DRY RUN] Would run gating training in {args.mode} mode")
+        print(f"    Logits dir: {args.logits_dir}")
+        print(f"    Splits dir: {args.splits_dir}")
         return
     
     try:
         # Import the training module based on mode
         if args.mode == 'pretrain':
             print("🎯 Running gating model warm-up (pretrain mode)")
-            command = "python -m src.train.train_gating_only --mode pretrain"
+            print(f"   - Uses GATING split (10% of train) for training")
+            print(f"   - Trains gating network to mix experts")
+            command = f"python -m src.train.train_gating_only --mode pretrain --logits-dir {args.logits_dir} --splits-dir {args.splits_dir}"
         elif args.mode == 'selective':
             print("🎯 Running gating model for expert selection (selective mode)")
-            command = "python -m src.train.train_gating_only --mode selective"
+            print(f"   - Uses TUNEV split for training (S1)")
+            print(f"   - Uses VAL split for validation (S2)")
+            print(f"   - Learns selective prediction")
+            command = f"python -m src.train.train_gating_only --mode selective --logits-dir {args.logits_dir} --splits-dir {args.splits_dir}"
         
         if args.verbose:
-            print(f"Executing: {command}")
+            print(f"\nExecuting: {command}")
         
         # Execute the training
         import subprocess
@@ -139,6 +160,11 @@ def main():
     # Setup environment
     setup_gating_environment(args)
     
+    # Display configuration
+    print(f"\n📂 Configuration:")
+    print(f"   Logits dir: {args.logits_dir}")
+    print(f"   Splits dir: {args.splits_dir}")
+    
     try:
         print(f"\n{'='*40}")
         print(f"🎯 Gating Training Mode: {args.mode.upper()}")
@@ -146,12 +172,15 @@ def main():
         
         if args.mode == 'pretrain':
             print("\n📋 Pretrain Mode:")
-            print("  - Warm up gating model")
-            print("  - Prepare for expert selection")
+            print("  - Uses GATING split (10% of train, long-tail)")
+            print("  - Trains gating network to mix experts")
+            print("  - Prepares for selective training")
         elif args.mode == 'selective':
             print("\n📋 Selective Mode:")
-            print("  - Train gating for expert selection")
-            print("  - Requires pretrained gating model")
+            print("  - Uses TUNEV split for training (balanced, from test set)")
+            print("  - Uses VAL split for validation (balanced, from test set)")
+            print("  - Learns selective prediction with coverage targets")
+            print("  - Requires pretrained gating model (run pretrain first)")
         
         # Run the training
         run_gating_training(args)

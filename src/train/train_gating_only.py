@@ -156,7 +156,10 @@ def compute_frequency_weights(labels, class_counts, smoothing=0.5):
     return freq_weights
 
 def load_data_from_logits(config):
-    """Load pre-computed logits for training gating."""
+    """
+    Load pre-computed logits for training gating (pretrain mode).
+    Uses GATING split (10% of train) for gating network training.
+    """
     logits_base = Path(config['experts']['logits_dir'])
     # Check if dataset subfolder exists (old structure), otherwise use base dir (new structure)
     logits_with_dataset = logits_base / config['dataset']['name']
@@ -170,25 +173,33 @@ def load_data_from_logits(config):
     num_experts = len(expert_names)
     num_classes = config['dataset']['num_classes']
     
-    # Use tuneV for gating training 
+    # Use GATING split (10% of train) for gating training
     cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
-    indices_path = splits_dir / 'tunev_indices.json'  # Fixed: lowercase 'v'
+    indices_path = splits_dir / 'gating_indices.json'
+    
+    if not indices_path.exists():
+        raise FileNotFoundError(f"Gating split not found: {indices_path}")
+    
     indices = json.loads(indices_path.read_text())
+    print(f"✅ Using GATING split for pretrain: {len(indices)} samples")
 
-    # Stack expert logits - support both .pt and .npz formats
+    # Stack expert logits - load from gating split
     stacked_logits = torch.zeros(len(indices), num_experts, num_classes)
     for i, expert_name in enumerate(expert_names):
-        # Try .npz first (new format), then .pt (old format)
-        npz_path = logits_root / expert_name / "tunev_logits.npz"
-        pt_path = logits_root / expert_name / "tuneV_logits.pt"
+        # Load gating logits
+        logits_path = logits_root / expert_name / "gating_logits.pt"
         
-        if npz_path.exists():
-            data = np.load(npz_path)
-            stacked_logits[:, i, :] = torch.from_numpy(data['logits'])
-        elif pt_path.exists():
-            stacked_logits[:, i, :] = torch.load(pt_path, map_location='cpu')
-        else:
-            raise FileNotFoundError(f"Missing logits for {expert_name} at {npz_path} or {pt_path}")
+        if not logits_path.exists():
+            raise FileNotFoundError(
+                f"Gating logits not found for expert {expert_name}: {logits_path}\n"
+                f"Please ensure experts are trained and logits exported."
+            )
+        
+        logits = torch.load(logits_path, map_location='cpu')
+        if logits.dtype == torch.float16:
+            logits = logits.float()
+        stacked_logits[:, i, :] = logits
+        print(f"  Loaded {expert_name}: {logits.shape}")
 
     labels = torch.tensor(np.array(cifar_train_full.targets)[indices])
     dataset = TensorDataset(stacked_logits, labels)
@@ -199,7 +210,11 @@ def load_data_from_logits(config):
 # ---------------------------- Selective Mode Utilities ---------------------------- #
 
 def load_two_splits_from_logits(config):
-    """Load tunev (S1) and val (S2) splits with stacked expert logits."""
+    """
+    Load tunev (S1) and val (S2) splits with stacked expert logits.
+    S1 (tunev): For training selective gating
+    S2 (val): For validation/evaluation
+    """
     logits_base = Path(config['experts']['logits_dir'])
     # Check if dataset subfolder exists (old structure), otherwise use base dir (new structure)
     logits_with_dataset = logits_base / config['dataset']['name']
@@ -213,38 +228,53 @@ def load_two_splits_from_logits(config):
     num_experts = len(expert_names)
     num_classes = config['dataset']['num_classes']
 
-    # Base datasets
-    cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
+    # Base dataset (both splits from test set now)
     cifar_test_full = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
 
     split_specs = [
-        ('tunev', cifar_test_full, 'tunev_indices.json'),  # Fixed: tunev from test set
-        ('val', cifar_test_full, 'val_indices.json')  # Fixed: val from test set (was val_lt)
+        ('tunev', cifar_test_full, 'tunev_indices.json', 'tunev_logits.pt'),
+        ('val', cifar_test_full, 'val_indices.json', 'val_logits.pt')
     ]
+    
+    print(f"Loading splits for selective training:")
+    print(f"  Logits root: {logits_root}")
     out = {}
-    for split_name, base_ds, fname in split_specs:
+    for split_name, base_ds, fname, logits_fname in split_specs:
         idx_path = splits_dir / fname
         if not idx_path.exists():
             raise FileNotFoundError(f"Missing indices file: {idx_path}")
+        
         indices = json.loads(idx_path.read_text())
         stacked = torch.zeros(len(indices), num_experts, num_classes)
+        
+        print(f"\n  Loading {split_name} split ({len(indices)} samples):")
         for i, ename in enumerate(expert_names):
-            # Try .npz first (new format), then .pt (old format)
-            npz_path = logits_root / ename / f"{split_name.lower()}_logits.npz"
-            pt_path = logits_root / ename / f"{split_name}_logits.pt"
+            logits_path = logits_root / ename / logits_fname
             
-            if npz_path.exists():
-                data = np.load(npz_path)
-                stacked[:, i, :] = torch.from_numpy(data['logits'])
-            elif pt_path.exists():
-                stacked[:, i, :] = torch.load(pt_path, map_location='cpu')
-            else:
-                raise FileNotFoundError(f"Missing logits file: {npz_path} or {pt_path}")
+            if not logits_path.exists():
+                raise FileNotFoundError(
+                    f"Logits not found for {ename} / {split_name}: {logits_path}\n"
+                    f"Please ensure experts are trained and logits exported."
+                )
+            
+            logits = torch.load(logits_path, map_location='cpu')
+            if logits.dtype == torch.float16:
+                logits = logits.float()
+            stacked[:, i, :] = logits
+            print(f"    {ename}: {logits.shape}")
         
         labels = torch.tensor(np.array(base_ds.targets)[indices])
         dataset = TensorDataset(stacked, labels)
-        out[split_name] = DataLoader(dataset, batch_size=CONFIG['gating_params']['batch_size'], shuffle=True if split_name=='tunev' else False, num_workers=4)
-    return out['tunev'], out['val']  # Fixed: use new split names
+        out[split_name] = DataLoader(
+            dataset, 
+            batch_size=CONFIG['gating_params']['batch_size'], 
+            shuffle=(split_name == 'tunev'), 
+            num_workers=4
+        )
+    
+    print(f"\n✅ Loaded S1 (tunev): {len(out['tunev'].dataset)} samples")
+    print(f"✅ Loaded S2 (val): {len(out['val'].dataset)} samples")
+    return out['tunev'], out['val']
 
 def build_group_priors(expert_names, K, head_boost=1.5, tail_boost=1.5):
     """Construct simple group-aware priors π_g over experts.
@@ -845,13 +875,17 @@ def train_gating_only():
     train_loader = load_data_from_logits(CONFIG)
     print(f"✅ Loaded training data: {len(train_loader)} batches")
     
-    # Get split counts from tunev for sample weighting (không phải full counts)
+    # Get split counts from gating split for sample weighting
     cifar_train_full = torchvision.datasets.CIFAR100(root='./data', train=True, download=False)
-    indices_path = Path(CONFIG['dataset']['splits_dir']) / 'tunev_indices.json'
+    indices_path = Path(CONFIG['dataset']['splits_dir']) / 'gating_indices.json'
+    
+    if not indices_path.exists():
+        raise FileNotFoundError(f"Gating split not found: {indices_path}")
+    
     indices = json.loads(indices_path.read_text())
     split_labels = torch.tensor(np.array(cifar_train_full.targets)[indices])
     split_counts = torch.bincount(split_labels, minlength=CONFIG['dataset']['num_classes']).float()
-    print("✅ Using tunev split counts (not full counts) for sample weighting")
+    print(f"✅ Using gating split counts for sample weighting ({len(indices)} samples)")
 
     # Set up grouping (for model creation, but α/μ won't be used)
     class_counts = get_cifar100_lt_counts(imb_factor=100)  # class_to_group still uses threshold from full LT

@@ -55,7 +55,7 @@ CONFIG = {
     'dataset': {
         'name': 'cifar100_lt_if100',
         'data_root': './data',
-        'splits_dir': './data/cifar100_lt_if100_splits',
+        'splits_dir': './data/cifar100_lt_if100_splits_fixed',
         'num_classes': 100,
         'num_groups': 2,
     },
@@ -75,13 +75,25 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # --- HELPER FUNCTIONS ---
 
-def get_dataloaders():
-    """Get train and validation dataloaders."""
+def get_dataloaders(use_expert_split=True):
+    """
+    Get train and validation dataloaders.
+    
+    Args:
+        use_expert_split: If True, use expert split (90% of train), else use full train
+    """
     print("Loading CIFAR-100-LT datasets...")
+    
+    if use_expert_split:
+        print("  Using EXPERT split (90% of train) for training")
+    else:
+        print("  Using FULL train split for training")
     
     train_loader, val_loader = get_expert_training_dataloaders(
         batch_size=CONFIG['train_params']['batch_size'],
-        num_workers=4
+        num_workers=4,
+        use_expert_split=use_expert_split,
+        splits_dir=CONFIG['dataset']['splits_dir']
     )
     
     print(f"  Train loader: {len(train_loader)} batches ({len(train_loader.dataset):,} samples)")
@@ -115,11 +127,49 @@ def get_loss_function(loss_type, train_loader):
         raise ValueError(f"Loss type '{loss_type}' not supported.")
 
 
-def validate_model(model, val_loader, device):
-    """Validate model with group-wise metrics."""
+def load_class_weights(splits_dir):
+    """Load class weights for reweighted validation metrics."""
+    weights_path = Path(splits_dir) / 'class_weights.json'
+    
+    if not weights_path.exists():
+        print(f"Warning: {weights_path} not found, using uniform weights")
+        return np.ones(100) / 100
+    
+    with open(weights_path, 'r') as f:
+        weights_data = json.load(f)
+    
+    # Handle both list and dict formats
+    if isinstance(weights_data, list):
+        weights = np.array(weights_data)
+    elif isinstance(weights_data, dict):
+        weights = np.array([weights_data[str(i)] for i in range(100)])
+    else:
+        raise ValueError(f"Unexpected format for class weights: {type(weights_data)}")
+    
+    return weights
+
+def validate_model(model, val_loader, device, class_weights=None):
+    """
+    Validate model with reweighted metrics.
+    
+    Args:
+        model: Model to validate
+        val_loader: Validation dataloader (balanced val split)
+        device: Device to use
+        class_weights: Class weights for reweighting (from training distribution)
+    
+    Returns:
+        overall_acc: Overall accuracy (unweighted, on balanced val)
+        reweighted_acc: Reweighted accuracy (simulates long-tail performance)
+        group_accs: Group-wise accuracies
+    """
     model.eval()
     correct = 0
     total = 0
+    
+    # For reweighted accuracy
+    class_correct = np.zeros(100)
+    class_total = np.zeros(100)
     
     group_correct = {'head': 0, 'tail': 0}
     group_total = {'head': 0, 'tail': 0}
@@ -133,20 +183,44 @@ def validate_model(model, val_loader, device):
             total += targets.size(0)
             correct += (predicted == targets).sum().item()
             
-            # Group-wise accuracy (Head: 0-49, Tail: 50-99)
+            # Per-class accuracy for reweighting
             for i, target in enumerate(targets):
-                pred = predicted[i]
-                if target < 50:  # Head classes
+                target_class = target.item()
+                pred = predicted[i].item()
+                
+                class_total[target_class] += 1
+                if pred == target_class:
+                    class_correct[target_class] += 1
+                
+                # Group-wise accuracy (Head: 0-49, Tail: 50-99)
+                if target_class < 50:  # Head classes
                     group_total['head'] += 1
-                    if pred == target:
+                    if pred == target_class:
                         group_correct['head'] += 1
                 else:  # Tail classes
                     group_total['tail'] += 1
-                    if pred == target:
+                    if pred == target_class:
                         group_correct['tail'] += 1
     
+    # Standard accuracy (on balanced val set)
     overall_acc = 100 * correct / total
     
+    # Reweighted accuracy (simulates long-tail performance)
+    if class_weights is not None:
+        # Per-class accuracy
+        class_acc = np.zeros(100)
+        for i in range(100):
+            if class_total[i] > 0:
+                class_acc[i] = class_correct[i] / class_total[i]
+            else:
+                class_acc[i] = 0.0
+        
+        # Reweighted accuracy using training distribution weights
+        reweighted_acc = 100 * np.sum(class_acc * class_weights)
+    else:
+        reweighted_acc = overall_acc
+    
+    # Group-wise accuracies
     group_accs = {}
     for group in ['head', 'tail']:
         if group_total[group] > 0:
@@ -154,7 +228,7 @@ def validate_model(model, val_loader, device):
         else:
             group_accs[group] = 0.0
     
-    return overall_acc, group_accs
+    return overall_acc, reweighted_acc, group_accs
 
 def export_logits_for_all_splits(model, expert_name):
     """Export logits for all dataset splits."""
@@ -172,15 +246,14 @@ def export_logits_for_all_splits(model, expert_name):
 
     # Define splits to export
     splits_info = [
-        # From training set
+        # From training set (CIFAR-100 train)
         {'name': 'train', 'dataset_type': 'train', 'file': 'train_indices.json'},
-        {'name': 'tuneV', 'dataset_type': 'train', 'file': 'tuneV_indices.json'},
-        {'name': 'val_small', 'dataset_type': 'train', 'file': 'val_small_indices.json'},
-        # From test set  
-        {'name': 'val_lt', 'dataset_type': 'test', 'file': 'val_lt_indices.json'},
-        {'name': 'test_lt', 'dataset_type': 'test', 'file': 'test_lt_indices.json'},
-        # Additional: calib split for CRC (if exists)
-        {'name': 'calib', 'dataset_type': 'train', 'file': 'calib_indices.json'},
+        {'name': 'expert', 'dataset_type': 'train', 'file': 'expert_indices.json'},
+        {'name': 'gating', 'dataset_type': 'train', 'file': 'gating_indices.json'},
+        # From test set (CIFAR-100 test) - balanced splits
+        {'name': 'val', 'dataset_type': 'test', 'file': 'val_indices.json'},
+        {'name': 'test', 'dataset_type': 'test', 'file': 'test_indices.json'},
+        {'name': 'tunev', 'dataset_type': 'test', 'file': 'tunev_indices.json'},
     ]
     
     for split_info in splits_info:
@@ -222,8 +295,14 @@ def export_logits_for_all_splits(model, expert_name):
 
 # --- CORE TRAINING FUNCTIONS ---
 
-def train_single_expert(expert_key):
-    """Train a single expert based on its configuration."""
+def train_single_expert(expert_key, use_expert_split=True):
+    """
+    Train a single expert based on its configuration.
+    
+    Args:
+        expert_key: Key identifying the expert ('ce', 'logitadjust', 'balsoftmax')
+        use_expert_split: If True, use expert split (90% of train), else use full train
+    """
     if expert_key not in EXPERT_CONFIGS:
         raise ValueError(f"Expert '{expert_key}' not found in EXPERT_CONFIGS")
     
@@ -234,13 +313,14 @@ def train_single_expert(expert_key):
     print(f"\n{'='*60}")
     print(f"🚀 TRAINING EXPERT: {expert_name.upper()}")
     print(f"🎯 Loss Type: {loss_type.upper()}")
+    print(f"📁 Splits Dir: {CONFIG['dataset']['splits_dir']}")
     print(f"{'='*60}")
     
     # Setup
     torch.manual_seed(CONFIG['seed'])
     np.random.seed(CONFIG['seed'])
     
-    train_loader, val_loader = get_dataloaders()
+    train_loader, val_loader = get_dataloaders(use_expert_split=use_expert_split)
     
     # Model and loss
     model = Expert(
@@ -271,8 +351,13 @@ def train_single_expert(expert_key):
         gamma=expert_config['gamma']
     )
     
+    # Load class weights for reweighted validation
+    class_weights = load_class_weights(CONFIG['dataset']['splits_dir'])
+    print(f"✅ Loaded class weights for reweighted validation")
+    
     # Training setup
     best_acc = 0.0
+    best_reweighted_acc = 0.0
     checkpoint_dir = Path(CONFIG['output']['checkpoints_dir']) / CONFIG['dataset']['name']
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_model_path = checkpoint_dir / f"best_{expert_name}.pth"
@@ -296,17 +381,21 @@ def train_single_expert(expert_key):
         
         scheduler.step()
         
-        # Validate
-        val_acc, group_accs = validate_model(model, val_loader, DEVICE)
+        # Validate with reweighting
+        val_acc, reweighted_acc, group_accs = validate_model(
+            model, val_loader, DEVICE, class_weights=class_weights
+        )
         
         print(f"Epoch {epoch+1:3d}: Loss={running_loss/len(train_loader):.4f}, "
-            f"Val Acc={val_acc:.2f}%, Head={group_accs['head']:.1f}%, "
-            f"Tail={group_accs['tail']:.1f}%, LR={scheduler.get_last_lr()[0]:.5f}")
+              f"Val Acc={val_acc:.2f}% (Reweighted={reweighted_acc:.2f}%), "
+              f"Head={group_accs['head']:.1f}%, Tail={group_accs['tail']:.1f}%, "
+              f"LR={scheduler.get_last_lr()[0]:.5f}")
         
-        # Save best model
-        if val_acc > best_acc:
+        # Save best model based on reweighted accuracy (better for long-tail)
+        if reweighted_acc > best_reweighted_acc:
+            best_reweighted_acc = reweighted_acc
             best_acc = val_acc
-            print(f"💾 New best! Saving to {best_model_path}")
+            print(f"💾 New best! Reweighted={reweighted_acc:.2f}% → Saving to {best_model_path}")
             torch.save(model.state_dict(), best_model_path)
     
     # Post-training: Calibration
@@ -321,11 +410,14 @@ def train_single_expert(expert_key):
     final_model_path = checkpoint_dir / f"final_calibrated_{expert_name}.pth"
     torch.save(model.state_dict(), final_model_path)
     
-    # Final validation
-    final_acc, final_group_accs = validate_model(model, val_loader, DEVICE)
-    print(f"📊 Final Results - Overall: {final_acc:.2f}%, "
-        f"Head: {final_group_accs['head']:.1f}%, "
-        f"Tail: {final_group_accs['tail']:.1f}%")
+    # Final validation with reweighting
+    final_acc, final_reweighted_acc, final_group_accs = validate_model(
+        model, val_loader, DEVICE, class_weights=class_weights
+    )
+    print(f"📊 Final Results:")
+    print(f"   Overall Acc: {final_acc:.2f}% (on balanced val)")
+    print(f"   Reweighted Acc: {final_reweighted_acc:.2f}% (simulates long-tail)")
+    print(f"   Head: {final_group_accs['head']:.1f}%, Tail: {final_group_accs['tail']:.1f}%")
     
     # Export logits
     export_logits_for_all_splits(model, expert_name)

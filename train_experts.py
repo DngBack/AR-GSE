@@ -76,6 +76,19 @@ def parse_arguments():
         help='Show configuration without training'
     )
     
+    parser.add_argument(
+        '--use-expert-split',
+        action='store_true',
+        default=True,
+        help='Use expert split (90%% of train) for training (default: True)'
+    )
+    
+    parser.add_argument(
+        '--use-full-train',
+        action='store_true',
+        help='Use full training set instead of expert split'
+    )
+    
     return parser.parse_args()
 
 def setup_training_environment(args):
@@ -132,18 +145,23 @@ def train_single_expert_wrapper(expert_key, args):
     try:
         from src.train.train_expert import train_single_expert
         
+        # Determine which split to use
+        use_expert_split = not args.use_full_train  # Default True unless --use-full-train
+        
         if args.verbose:
             print(f"\n📋 Training configuration for {expert_key}:")
             from src.train.train_expert import EXPERT_CONFIGS
             config = EXPERT_CONFIGS[expert_key]
             for key, value in config.items():
                 print(f"  {key}: {value}")
+            print(f"  use_expert_split: {use_expert_split}")
         
         if args.dry_run:
             print(f"🔍 [DRY RUN] Would train expert: {expert_key}")
+            print(f"    Using {'expert split (90% train)' if use_expert_split else 'full train'}")
             return f"checkpoints/experts/cifar100_lt_if100/{expert_key}_model.pth"
         
-        model_path = train_single_expert(expert_key)
+        model_path = train_single_expert(expert_key, use_expert_split=use_expert_split)
         return model_path
         
     except Exception as e:
@@ -156,6 +174,20 @@ def main():
     print("=" * 60)
     print("AR-GSE EXPERT TRAINING")
     print("=" * 60)
+    
+    # Determine split usage
+    use_expert_split = not args.use_full_train
+    if use_expert_split:
+        print("📊 Training Mode: Using EXPERT split (90% of train)")
+        print("   - Trains on 9,719 samples (expert split)")
+        print("   - Validates on 1,000 samples (balanced val)")
+        print("   - Uses reweighted metrics for validation")
+    else:
+        print("📊 Training Mode: Using FULL train set")
+        print("   - Trains on 10,847 samples (full train)")
+        print("   - Validates on 1,000 samples (balanced val)")
+        print("   - Uses reweighted metrics for validation")
+    print()
     
     # Setup environment
     setup_training_environment(args)

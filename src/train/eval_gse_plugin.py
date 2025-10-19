@@ -1,19 +1,21 @@
 """
-Comprehensive AURC Evaluation (Correct Methodology)
+Comprehensive AURC Evaluation (Correct Methodology with Reweighting)
 
-This script follows the proper AURC evaluation methodology:
-  - Validation set: tuneV + val_lt (combined for threshold optimization)
-  - Test set: test_lt (held-out for final evaluation)
+This script follows the proper AURC evaluation methodology for AR-GSE:
+  - Validation set: tuneV + val (combined for threshold optimization)
+  - Test set: test (held-out for final evaluation)
+  - All splits are balanced (from test set), but metrics are reweighted for long-tail
 
-The algorithm:
-  1. For each rejection cost c and metric (standard/balanced/worst):
-     - Find optimal threshold on validation set (tuneV + val_lt)
-     - Apply that threshold to test set (test_lt) to measure coverage and risk
-  2. Compute AURC by integrating risk over coverage
+The AR-GSE algorithm:
+  1. Compute RAW margins: score - threshold_per_sample (without c)
+  2. For each rejection cost c:
+     - Accept if: raw_margin >= -c
+     - This is equivalent to: margin + c >= 0 (where margin = raw_margin)
+  3. Compute coverage and risk on test set
+  4. Integrate risk over coverage to get AURC
 
-It loads optimal parameters (α*, μ*, and gating) from the plugin checkpoint,
-computes mixture posteriors, constructs GSE margins as confidence scores, and
-then sweeps rejection costs to produce risk–coverage curves.
+Key insight: For AR-GSE, the threshold is deterministic (threshold = -c).
+No optimization needed - just evaluate at each cost value.
 
 Outputs:
   - aurc_detailed_results.csv: RC points for each metric
@@ -32,7 +34,7 @@ import torchvision
 
 # Custom modules
 from src.models.argse import AR_GSE
-from src.train.gse_balanced_plugin import compute_margin
+from src.train.gse_balanced_plugin import compute_raw_margin  # Import RAW margin (no c subtraction)
 from src.metrics.reweighted_metrics import ReweightedMetrics  # Import reweighted metrics
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -45,7 +47,7 @@ CONFIG = {
     },
     'experts': {
         'names': ['ce_baseline', 'logitadjust_baseline', 'balsoftmax_baseline'],
-        'logits_dir': './outputs/logits_fixed',  # Updated to use recomputed logits
+        'logits_dir': './outputs/logits/cifar100_lt_if100/',  # Updated path
     },
     'aurc_eval': {
         # Choose evaluation mode:
@@ -215,65 +217,52 @@ def compute_group_risk_for_aurc(preds, labels, accepted_mask, class_to_group, K,
         raise ValueError(f"Unknown metric type: {metric_type}. Use 'balanced' or 'worst'.")
 
 def find_optimal_threshold_for_cost(confidence_scores, preds, labels, class_to_group, K, 
-                                   cost_c, class_weights=None, metric_type="balanced"):
+                                   cost_c, class_weights=None, metric_type="balanced",
+                                   use_per_group=False, t_group_base=None):
     """
-    Find optimal threshold that minimizes Chow's objective:
-        Expected Cost = coverage * risk + (1-coverage) * c
+    Find optimal threshold for a given cost.
     
-    This is the CORRECT selective prediction objective:
-        - When we accept a sample (with probability = coverage), we pay risk (error rate)
-        - When we reject a sample (with probability = 1-coverage), we pay rejection cost c
+    Two modes:
+    1. Global threshold (use_per_group=False): threshold = -c
+    2. Per-group thresholds (use_per_group=True): t_k = t_group_base[k] * scale
     
     Args:
-        confidence_scores: [N] confidence scores (GSE margins)
+        confidence_scores: [N] RAW confidence scores (raw GSE margins)
         preds: [N] predictions
         labels: [N] true labels
         class_to_group: [C] class to group mapping
         K: number of groups
-        cost_c: rejection cost (typically in [0, 1])
+        cost_c: rejection cost or scale factor
         class_weights: dict mapping class_id -> weight (for reweighting), or None
         metric_type: risk metric type
+        use_per_group: if True, use per-group thresholds with scaling
+        t_group_base: [K] base per-group thresholds (for scaling)
         
     Returns:
-        optimal_threshold: scalar threshold value
+        optimal_threshold: scalar (global mode) or tensor [K] (per-group mode)
     """
-    # Create candidate thresholds from unique confidence scores
-    unique_scores = torch.unique(confidence_scores)
-    thresholds = torch.cat([torch.tensor([confidence_scores.min().item() - 1.0]), 
-                           unique_scores, 
-                           torch.tensor([confidence_scores.max().item() + 1.0])])
-    thresholds = torch.sort(thresholds, descending=True)[0]  # High to low
-    
-    best_cost = float('inf')
-    best_threshold = 0.0
-    
-    for threshold in thresholds:
-        accepted = confidence_scores >= threshold
-        coverage = accepted.float().mean().item()
-        
-        # Handle edge case: no samples accepted
-        if coverage == 0.0:
-            # When rejecting all, cost = c (full rejection penalty)
-            objective = cost_c
-        else:
-            risk = compute_group_risk_for_aurc(preds, labels, accepted, class_to_group, K, 
-                                              class_weights, metric_type)
-            # CORRECT Chow's rule objective: 
-            # Expected cost = coverage * risk + (1-coverage) * c
-            # = proportion_accepted * error_rate + proportion_rejected * rejection_cost
-            objective = coverage * risk + (1.0 - coverage) * cost_c
-        
-        if objective < best_cost:
-            best_cost = objective
-            best_threshold = threshold.item()
-    
-    return best_threshold
+    if use_per_group and t_group_base is not None:
+        # Per-group mode: scale base thresholds
+        # cost_c acts as a scale factor (0.0 = reject all, large = accept all)
+        # We want: cost_c=0 → very negative thresholds (reject all)
+        #          cost_c=1 → original thresholds
+        #          cost_c>1 → even more lenient
+        scale = cost_c
+        return t_group_base * scale
+    else:
+        # Global mode: threshold = -c (original AR-GSE)
+        return -cost_c
 
 def sweep_cost_values_aurc(confidence_scores_val, preds_val, labels_val, 
                           confidence_scores_test, preds_test, labels_test,
-                          class_to_group, K, cost_values, class_weights=None, metric_type="balanced"):
+                          class_to_group, K, cost_values, class_weights=None, metric_type="balanced",
+                          use_per_group=False, t_group_base=None):
     """
     Sweep cost values and return (cost, coverage, risk) points on test set.
+    
+    Supports two modes:
+    1. Global threshold: threshold = -c for all samples
+    2. Per-group thresholds: t_k = t_group_base[k] * scale for each group
     
     Args:
         confidence_scores_val: [N_val] validation confidence scores
@@ -287,23 +276,34 @@ def sweep_cost_values_aurc(confidence_scores_val, preds_val, labels_val,
         cost_values: array of cost values to sweep
         class_weights: dict mapping class_id -> weight (for reweighting), or None
         metric_type: risk metric type
+        use_per_group: if True, use per-group thresholds
+        t_group_base: [K] base per-group thresholds (for scaling)
         
     Returns:
         rc_points: list of (cost, coverage, risk) tuples
     """
     rc_points = []
     
-    print(f"🔄 Sweeping {len(cost_values)} cost values for {metric_type} metric...")
+    mode_str = "per-group" if use_per_group else "global"
+    print(f"🔄 Sweeping {len(cost_values)} cost values for {metric_type} metric ({mode_str} mode)...")
     
     for i, cost_c in enumerate(cost_values):
-        # Find optimal threshold on validation
+        # Find optimal threshold (global or per-group)
         optimal_threshold = find_optimal_threshold_for_cost(
             confidence_scores_val, preds_val, labels_val, class_to_group, K, cost_c, 
-            class_weights, metric_type
+            class_weights, metric_type, use_per_group, t_group_base
         )
         
         # Apply to test set
-        accepted_test = confidence_scores_test >= optimal_threshold
+        if use_per_group and t_group_base is not None:
+            # Per-group thresholds: different threshold per sample based on label's group
+            test_groups = class_to_group[labels_test]
+            thresholds_per_sample = optimal_threshold[test_groups]
+            accepted_test = confidence_scores_test > thresholds_per_sample
+        else:
+            # Global threshold: same for all samples
+            accepted_test = confidence_scores_test >= optimal_threshold
+            
         coverage_test = accepted_test.float().mean().item()
         risk_test = compute_group_risk_for_aurc(preds_test, labels_test, accepted_test, 
                                                class_to_group, K, class_weights, metric_type)
@@ -550,10 +550,24 @@ def main():
     mu_star = checkpoint['mu'].to(DEVICE)
     class_to_group = checkpoint['class_to_group'].to(DEVICE)
     num_groups = checkpoint['num_groups']
+    
+    # Load per-group thresholds if available
+    use_per_group_thresholds = checkpoint.get('per_group_threshold', False)
+    if 't_group' in checkpoint:
+        t_group_star = checkpoint['t_group']
+        if isinstance(t_group_star, list):
+            t_group_star = torch.tensor(t_group_star, dtype=torch.float32)
+        t_group_star = t_group_star.to(DEVICE)
+    else:
+        t_group_star = None
+        use_per_group_thresholds = False
 
     print("✅ Loaded optimal parameters:")
     print(f"   α* = {alpha_star.detach().cpu().tolist()}")
     print(f"   μ* = {mu_star.detach().cpu().tolist()}")
+    if use_per_group_thresholds and t_group_star is not None:
+        print(f"   t_group* = {t_group_star.detach().cpu().tolist()}")
+        print(f"   → Using PER-GROUP thresholds (consistent with plugin training)")
 
     # 2) Build AR-GSE and load gating
     num_experts = len(CONFIG['experts']['names'])
@@ -590,64 +604,73 @@ def main():
         model.mu.copy_(mu_star)
     print("✅ Model configured with optimal parameters and gating ready")
 
-    # 3) Load AURC splits: tuneV + val_lt (validation), test_lt (test)
+    # 3) Load AURC splits: tuneV + val (validation), test (test)
     print("\n" + "="*60)
-    print("COMPREHENSIVE AURC EVALUATION")
+    print("COMPREHENSIVE AURC EVALUATION (REWEIGHTED)")
     print("="*60)
-    (tunev_logits, tunev_labels, _), (val_lt_logits, val_lt_labels, _), (test_logits, test_labels, _) = load_aurc_splits_data()
+    (tunev_logits, tunev_labels, _), (val_logits, val_labels, _), (test_logits, test_labels, _) = load_aurc_splits_data()
     
-    print(f"📊 Validation set (tuneV + val_lt): {len(tunev_labels) + len(val_lt_labels)} samples")
-    print(f"📊 Test set (test_lt): {len(test_labels)} samples")
-    print("✅ Correct methodology: Optimize thresholds on (tuneV + val_lt), evaluate on test_lt")
+    print(f"📊 Validation set (tuneV + val): {len(tunev_labels) + len(val_labels)} samples (balanced)")
+    print(f"📊 Test set (test): {len(test_labels)} samples (balanced)")
+    print("✅ Correct methodology: Optimize thresholds on (tuneV + val), evaluate on test")
+    print("✅ All splits are balanced, metrics reweighted for long-tail performance")
 
     # 4) Compute mixture posteriors and GSE margins/predictions
     print("\n🔮 Computing mixture posteriors for all splits...")
     tunev_eta_mix = get_mixture_posteriors(model, tunev_logits)
-    val_lt_eta_mix = get_mixture_posteriors(model, val_lt_logits)
+    val_eta_mix = get_mixture_posteriors(model, val_logits)
     test_eta_mix = get_mixture_posteriors(model, test_logits)
 
     class_to_group_cpu = class_to_group.cpu()
     alpha_star_cpu = alpha_star.cpu()
     mu_star_cpu = mu_star.cpu()
 
-    # Compute margins for all splits
-    gse_margins_tunev = compute_margin(tunev_eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
-    gse_margins_val_lt = compute_margin(val_lt_eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
-    gse_margins_test = compute_margin(test_eta_mix, alpha_star_cpu, mu_star_cpu, 0.0, class_to_group_cpu)
+    # Compute RAW margins for all splits (without subtracting c)
+    # The threshold c will be applied during AURC evaluation
+    gse_margins_tunev = compute_raw_margin(tunev_eta_mix, alpha_star_cpu, mu_star_cpu, class_to_group_cpu)
+    gse_margins_val = compute_raw_margin(val_eta_mix, alpha_star_cpu, mu_star_cpu, class_to_group_cpu)
+    gse_margins_test = compute_raw_margin(test_eta_mix, alpha_star_cpu, mu_star_cpu, class_to_group_cpu)
 
     # Compute predictions for all splits
     preds_tunev = (alpha_star_cpu[class_to_group_cpu] * tunev_eta_mix).argmax(dim=1)
-    preds_val_lt = (alpha_star_cpu[class_to_group_cpu] * val_lt_eta_mix).argmax(dim=1)
+    preds_val = (alpha_star_cpu[class_to_group_cpu] * val_eta_mix).argmax(dim=1)
     preds_test = (alpha_star_cpu[class_to_group_cpu] * test_eta_mix).argmax(dim=1)
     
-    # Combine tuneV + val_lt as validation set for threshold optimization
-    gse_margins_val_combined = torch.cat([gse_margins_tunev, gse_margins_val_lt])
-    preds_val_combined = torch.cat([preds_tunev, preds_val_lt])
-    labels_val_combined = torch.cat([tunev_labels, val_lt_labels])
+    # Combine tuneV + val as validation set for threshold optimization
+    gse_margins_val_combined = torch.cat([gse_margins_tunev, gse_margins_val])
+    preds_val_combined = torch.cat([preds_tunev, preds_val])
+    labels_val_combined = torch.cat([tunev_labels, val_labels])
     
     print(f"✅ Combined validation set: {len(labels_val_combined)} samples")
 
     # 5) Debug confidence scores distribution first
-    print("\n🔍 DEBUGGING: GSE margin distribution")
-    print(f"   Test margins - min: {gse_margins_test.min():.4f}, max: {gse_margins_test.max():.4f}")
-    print(f"   Test margins - mean: {gse_margins_test.mean():.4f}, std: {gse_margins_test.std():.4f}")
+    print("\n🔍 DEBUGGING: GSE RAW margin distribution")
+    print(f"   Test raw margins - min: {gse_margins_test.min():.4f}, max: {gse_margins_test.max():.4f}")
+    print(f"   Test raw margins - mean: {gse_margins_test.mean():.4f}, std: {gse_margins_test.std():.4f}")
     
     # Check percentiles to understand distribution
     percentiles = [5, 10, 25, 50, 75, 90, 95]
     margin_percentiles = torch.quantile(gse_margins_test, torch.tensor([p/100.0 for p in percentiles]))
     print(f"   Percentiles: {dict(zip(percentiles, [f'{v:.4f}' for v in margin_percentiles]))}")
     
-    # Debug threshold behavior with a few cost values
-    print("\n🔍 DEBUGGING: Threshold behavior for different costs")
-    debug_costs = [0.0, 0.1, 0.5, 0.75, 0.99]
-    for cost_c in debug_costs:
-        optimal_threshold = find_optimal_threshold_for_cost(
-            gse_margins_val_combined, preds_val_combined, labels_val_combined, 
-            class_to_group_cpu, num_groups, cost_c, class_weights, 'balanced'
-        )
-        accepted_test = gse_margins_test >= optimal_threshold
-        coverage_test = accepted_test.float().mean().item()
-        print(f"   c={cost_c:.2f} → threshold={optimal_threshold:.4f} → coverage={coverage_test:.4f}")
+    # Debug threshold behavior
+    if use_per_group_thresholds and t_group_star is not None:
+        print("\n🔍 DEBUGGING: Per-group threshold behavior")
+        print(f"   Base thresholds: {t_group_star.cpu().tolist()}")
+        debug_scales = [0.0, 0.5, 1.0, 1.5, 2.0]
+        for scale in debug_scales:
+            t_scaled = t_group_star.cpu() * scale  # Move to CPU for consistency
+            test_groups = class_to_group_cpu[test_labels]
+            thresholds_per_sample = t_scaled[test_groups]
+            coverage_test = (gse_margins_test > thresholds_per_sample).float().mean().item()
+            print(f"   scale={scale:.1f} → t_group={t_scaled.tolist()} → coverage={coverage_test:.4f}")
+    else:
+        print("\n🔍 DEBUGGING: Global threshold behavior (threshold = -c)")
+        debug_costs = [0.0, 0.1, 0.5, 0.75, 0.99]
+        for cost_c in debug_costs:
+            threshold = -cost_c  # AR-GSE threshold is deterministic
+            coverage_test = (gse_margins_test >= threshold).float().mean().item()
+            print(f"   c={cost_c:.2f} → threshold={threshold:.4f} → coverage={coverage_test:.4f}")
     
     # 6) Sweep cost values and compute AURC
     mode = CONFIG['aurc_eval']['mode']
@@ -671,6 +694,25 @@ def main():
 
     aurc_results = {}
     all_rc_points = {}
+    
+    # Determine cost/scale values based on mode
+    if use_per_group_thresholds and t_group_star is not None:
+        # Per-group mode: use scale factors
+        # We want to sweep from very selective (scale~0) to very lenient (scale>1)
+        # Base thresholds are negative, so scale=0 → very negative (reject all)
+        #                                scale=1 → original thresholds
+        #                                scale=2+ → more lenient
+        scale_values = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.5, 3.0, 4.0, 5.0]
+        print(f"\n🎯 Scale grid (per-group mode): {len(scale_values)} values from {scale_values[0]:.1f} to {scale_values[-1]:.1f}")
+        print(f"   Base thresholds: {t_group_star.cpu().tolist()}")
+        print(f"   → scale=0: very selective (reject most)")
+        print(f"   → scale=1: original thresholds from training")
+        print(f"   → scale>1: more lenient (accept more)")
+        sweep_values = scale_values
+    else:
+        # Global mode: use regular cost values
+        sweep_values = cost_values
+    
     for metric in metrics:
         print(f"\n🔄 Processing {metric} metric {'(REWEIGHTED)' if class_weights else ''}...")
         print(f"   • Optimizing thresholds on validation (tunev + val): {len(labels_val_combined)} samples")
@@ -679,7 +721,8 @@ def main():
         rc_points = sweep_cost_values_aurc(
             gse_margins_val_combined, preds_val_combined, labels_val_combined,  # Validation
             gse_margins_test, preds_test, test_labels,                          # Test
-            class_to_group_cpu, num_groups, cost_values, class_weights, metric  # Pass class_weights
+            class_to_group_cpu, num_groups, sweep_values, class_weights, metric,  # Pass class_weights
+            use_per_group_thresholds, t_group_star.cpu() if use_per_group_thresholds else None  # Per-group params
         )
         aurc_full = compute_aurc_from_points(rc_points, coverage_range='full')
         aurc_02_10 = compute_aurc_from_points(rc_points, coverage_range='0.2-1.0')

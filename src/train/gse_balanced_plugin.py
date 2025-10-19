@@ -18,6 +18,27 @@ from src.data.datasets import get_cifar100_lt_counts
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+def load_class_weights(splits_dir):
+    """Load class weights for reweighted metrics from training distribution."""
+    weights_path = Path(splits_dir) / 'class_weights.json'
+    
+    if not weights_path.exists():
+        print(f"⚠️  Warning: {weights_path} not found, using uniform weights")
+        return torch.ones(100) / 100
+    
+    with open(weights_path, 'r') as f:
+        weights_data = json.load(f)
+    
+    # Handle both list and dict formats
+    if isinstance(weights_data, list):
+        weights = torch.tensor(weights_data, dtype=torch.float32)
+    else:
+        # If dict, convert keys to int indices
+        weights = torch.tensor([weights_data[str(i)] for i in range(100)], dtype=torch.float32)
+    
+    print(f"✅ Loaded class weights from {weights_path}")
+    return weights
+
 # --- CONFIGURATION ---
 CONFIG = {
     'dataset': {
@@ -30,7 +51,7 @@ CONFIG = {
     },
     'experts': {
         'names': ['ce_baseline', 'logitadjust_baseline', 'balsoftmax_baseline'],
-        'logits_dir': './outputs/logits_fixed/',  # Updated for recomputed logits
+        'logits_dir': './outputs/logits/cifar100_lt_if100/',  # Updated path
     },
     'plugin_params': {
         'c': 0.2,  # rejection cost
@@ -133,9 +154,18 @@ def accepted_and_pred(eta, alpha, mu, c, class_to_group):
     preds = (alpha[class_to_group] * eta).argmax(dim=1)
     return accepted, preds, margin
 
-def balanced_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
+def balanced_error_on_S(eta, y, alpha, mu, c, class_to_group, K, class_weights=None):
     """
-    Compute balanced error rate on a split S.
+    Compute balanced error rate on a split S with optional reweighting.
+    
+    Args:
+        eta: mixture posteriors [N, C]
+        y: labels [N]
+        alpha, mu: parameters [K]
+        c: threshold
+        class_to_group: class->group mapping [C]
+        K: number of groups
+        class_weights: optional class weights for reweighting [C]
     
     Returns:
         bal_error: balanced error (average of per-group errors)
@@ -150,20 +180,65 @@ def balanced_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
     y_groups = class_to_group[y]  # [N]
     group_errors = []
     
-    for k in range(K):
-        mask_k = (y_groups == k) & accepted
-        if mask_k.sum() == 0:
-            # No accepted samples in group k
-            group_errors.append(1.0)
-        else:
-            group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
-            group_errors.append(1.0 - group_acc)
+    if class_weights is not None:
+        # Reweighted error computation
+        device = eta.device
+        class_weights = class_weights.to(device)
+        
+        for k in range(K):
+            mask_k = (y_groups == k) & accepted
+            if mask_k.sum() == 0:
+                group_errors.append(1.0)
+            else:
+                # Per-class accuracy within group
+                y_k = y[mask_k]
+                preds_k = preds[mask_k]
+                
+                # Compute per-class accuracy
+                class_acc = torch.zeros(len(class_weights), device=device)
+                class_count = torch.zeros(len(class_weights), device=device)
+                
+                for c_idx in range(len(class_weights)):
+                    class_mask = (y_k == c_idx)
+                    if class_mask.sum() > 0:
+                        class_count[c_idx] = class_mask.sum().float()
+                        class_acc[c_idx] = (preds_k[class_mask] == c_idx).float().sum()
+                
+                # Weighted accuracy for this group
+                classes_in_group = (class_to_group == k).nonzero(as_tuple=True)[0]
+                group_weights = class_weights[classes_in_group]
+                group_weights = group_weights / group_weights.sum()  # Normalize within group
+                
+                weighted_acc = 0.0
+                for i, c_idx in enumerate(classes_in_group):
+                    if class_count[c_idx] > 0:
+                        weighted_acc += group_weights[i] * (class_acc[c_idx] / class_count[c_idx])
+                
+                group_errors.append(1.0 - weighted_acc.item())
+    else:
+        # Standard (unweighted) error
+        for k in range(K):
+            mask_k = (y_groups == k) & accepted
+            if mask_k.sum() == 0:
+                group_errors.append(1.0)
+            else:
+                group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
+                group_errors.append(1.0 - group_acc)
     
     return float(np.mean(group_errors)), group_errors
 
-def worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
+def worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K, class_weights=None):
     """
-    Compute worst-group error rate on a split S.
+    Compute worst-group error rate on a split S with optional reweighting.
+    
+    Args:
+        eta: mixture posteriors [N, C]
+        y: labels [N]
+        alpha, mu: parameters [K]
+        c: threshold
+        class_to_group: class->group mapping [C]
+        K: number of groups
+        class_weights: optional class weights for reweighting [C]
     
     Returns:
         worst_error: worst-group error (max of per-group errors)
@@ -178,20 +253,56 @@ def worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K):
     y_groups = class_to_group[y]  # [N]
     group_errors = []
     
-    for k in range(K):
-        mask_k = (y_groups == k) & accepted
-        if mask_k.sum() == 0:
-            # No accepted samples in group k
-            group_errors.append(1.0)
-        else:
-            group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
-            group_errors.append(1.0 - group_acc)
+    if class_weights is not None:
+        # Reweighted error computation
+        device = eta.device
+        class_weights = class_weights.to(device)
+        
+        for k in range(K):
+            mask_k = (y_groups == k) & accepted
+            if mask_k.sum() == 0:
+                group_errors.append(1.0)
+            else:
+                # Per-class accuracy within group
+                y_k = y[mask_k]
+                preds_k = preds[mask_k]
+                
+                # Compute per-class accuracy
+                class_acc = torch.zeros(len(class_weights), device=device)
+                class_count = torch.zeros(len(class_weights), device=device)
+                
+                for c_idx in range(len(class_weights)):
+                    class_mask = (y_k == c_idx)
+                    if class_mask.sum() > 0:
+                        class_count[c_idx] = class_mask.sum().float()
+                        class_acc[c_idx] = (preds_k[class_mask] == c_idx).float().sum()
+                
+                # Weighted accuracy for this group
+                classes_in_group = (class_to_group == k).nonzero(as_tuple=True)[0]
+                group_weights = class_weights[classes_in_group]
+                group_weights = group_weights / group_weights.sum()  # Normalize within group
+                
+                weighted_acc = 0.0
+                for i, c_idx in enumerate(classes_in_group):
+                    if class_count[c_idx] > 0:
+                        weighted_acc += group_weights[i] * (class_acc[c_idx] / class_count[c_idx])
+                
+                group_errors.append(1.0 - weighted_acc.item())
+    else:
+        # Standard (unweighted) error
+        for k in range(K):
+            mask_k = (y_groups == k) & accepted
+            if mask_k.sum() == 0:
+                group_errors.append(1.0)
+            else:
+                group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
+                group_errors.append(1.0 - group_acc)
     
     return float(max(group_errors)), group_errors
 
-def worst_error_on_S_with_per_group_thresholds(eta, y, alpha, mu, t_group, class_to_group, K):
+def worst_error_on_S_with_per_group_thresholds(eta, y, alpha, mu, t_group, class_to_group, K, class_weights=None):
     """
-    Compute worst-group error rate using per-group thresholds t_k.
+    Compute worst-group error rate using per-group thresholds t_k with optional reweighting.
     
     Args:
         eta: mixture posteriors [N, C]
@@ -200,6 +311,7 @@ def worst_error_on_S_with_per_group_thresholds(eta, y, alpha, mu, t_group, class
         t_group: per-group thresholds [K]
         class_to_group: class -> group mapping [C]
         K: number of groups
+        class_weights: optional class weights for reweighting [C]
         
     Returns:
         worst_error: worst-group error (max of per-group errors)
@@ -225,25 +337,66 @@ def worst_error_on_S_with_per_group_thresholds(eta, y, alpha, mu, t_group, class
     preds = (alpha_per_class * eta).argmax(dim=1)  # [N]
     
     group_errors = []
-    for k in range(K):
-        mask_k = (y_groups == k) & accepted
-        if mask_k.sum() == 0:
-            group_errors.append(1.0)
-        else:
-            group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
-            group_errors.append(1.0 - group_acc)
+    
+    if class_weights is not None:
+        # Reweighted error computation
+        device = eta.device
+        class_weights = class_weights.to(device)
+        
+        for k in range(K):
+            mask_k = (y_groups == k) & accepted
+            if mask_k.sum() == 0:
+                group_errors.append(1.0)
+            else:
+                # Per-class accuracy within group
+                y_k = y[mask_k]
+                preds_k = preds[mask_k]
+                
+                # Compute per-class accuracy
+                class_acc = torch.zeros(len(class_weights), device=device)
+                class_count = torch.zeros(len(class_weights), device=device)
+                
+                for c_idx in range(len(class_weights)):
+                    class_mask = (y_k == c_idx)
+                    if class_mask.sum() > 0:
+                        class_count[c_idx] = class_mask.sum().float()
+                        class_acc[c_idx] = (preds_k[class_mask] == c_idx).float().sum()
+                
+                # Weighted accuracy for this group
+                classes_in_group = (class_to_group == k).nonzero(as_tuple=True)[0]
+                group_weights = class_weights[classes_in_group]
+                group_weights = group_weights / group_weights.sum()  # Normalize within group
+                
+                weighted_acc = 0.0
+                for i, c_idx in enumerate(classes_in_group):
+                    if class_count[c_idx] > 0:
+                        weighted_acc += group_weights[i] * (class_acc[c_idx] / class_count[c_idx])
+                
+                group_errors.append(1.0 - weighted_acc.item())
+    else:
+        # Standard (unweighted) error
+        for k in range(K):
+            mask_k = (y_groups == k) & accepted
+            if mask_k.sum() == 0:
+                group_errors.append(1.0)
+            else:
+                group_acc = (preds[mask_k] == y[mask_k]).float().mean().item()
+                group_errors.append(1.0 - group_acc)
     
     return float(max(group_errors)), group_errors
 
-def hybrid_error_on_S(eta, y, alpha, mu, c, class_to_group, K, beta=0.2):
+def hybrid_error_on_S(eta, y, alpha, mu, c, class_to_group, K, beta=0.2, class_weights=None):
     """
-    Compute hybrid error: worst_error + beta * balanced_error
+    Compute hybrid error: worst_error + beta * balanced_error with optional reweighting
+    
+    Args:
+        class_weights: optional class weights for reweighting [C]
     
     Returns:
         hybrid_error: worst + beta * balanced
         (worst_error, balanced_error): individual components
     """
-    worst_err, group_errs = worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K)
+    worst_err, group_errs = worst_error_on_S(eta, y, alpha, mu, c, class_to_group, K, class_weights)
     bal_err = float(np.mean(group_errs))
     
     hybrid_err = worst_err + beta * bal_err
@@ -350,9 +503,10 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
                     c, M=10, lambda_grid=None,
                     alpha_init=None, gamma=0.3, cov_target=0.6, 
                     objective='balanced', hybrid_beta=0.2, alpha_steps=4,
-                    use_conditional_alpha=True, tie_break_balanced=True, use_ema_mu=True):
+                    use_conditional_alpha=True, tie_break_balanced=True, use_ema_mu=True,
+                    class_weights=None):
     """
-    Main GSE-Balanced plugin algorithm with improved optimization strategies.
+    Main GSE-Balanced plugin algorithm with improved optimization strategies and reweighting.
     
     Args:
         eta_S1, y_S1: cached posteriors and labels for S1 (tuning split)
@@ -372,6 +526,7 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
         alpha_steps: number of fixed-point steps for alpha updates
         use_conditional_alpha: use conditional acceptance for alpha updates
         tie_break_balanced: use balanced AURC for tie-breaking in worst optimization
+        class_weights: optional class weights [C] for reweighted error computation
         
     Returns:
         best_alpha: optimal α* 
@@ -382,6 +537,11 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
     y_S1 = y_S1.to(device)
     y_S2 = y_S2.to(device)
     class_to_group = class_to_group.to(device)
+    
+    # Move class weights to device if provided
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
+        print(f"✅ Using reweighted metrics with class weights")
     
     # Default to expanded λ grid if not provided
     if lambda_grid is None:
@@ -435,23 +595,23 @@ def gse_balanced_plugin(eta_S1, y_S1, eta_S2, y_S2, class_to_group, K,
                         gamma=gamma, use_conditional=use_conditional_alpha
                     )
 
-            # Evaluate on S2 with same t_cur according to objective
+            # Evaluate on S2 with same t_cur according to objective (with reweighting)
             if objective == 'worst':
                 error_score, group_errs = worst_error_on_S(
-                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K
+                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K, class_weights
                 )
                 error_type = "worst"
                 # Also compute balanced for tie-breaking
                 balanced_score = float(np.mean(group_errs))
             elif objective == 'balanced':
                 error_score, group_errs = balanced_error_on_S(
-                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K
+                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K, class_weights
                 )
                 error_type = "bal"
                 balanced_score = error_score
             elif objective == 'hybrid':
                 error_score, (worst_err, bal_err) = hybrid_error_on_S(
-                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K, hybrid_beta
+                    eta_S2, y_S2, alpha_cur, mu, t_cur, class_to_group, K, hybrid_beta, class_weights
                 )
                 error_type = f"hybrid(w={worst_err:.3f},b={bal_err:.3f})"
                 balanced_score = bal_err
@@ -531,9 +691,11 @@ def load_data_from_logits(config):
     else:
         logits_root = logits_dir
     
+    print(f"📂 Loading logits from: {logits_root}")
+    
     dataloaders = {}
     
-    # Base datasets - both splits are from test set (balanced)
+    # Base dataset - both splits are from test set (balanced)
     cifar_test_full = torchvision.datasets.CIFAR100(root='./data', train=False, download=False)
     
     # Use tunev (S1) and val (S2) splits - both from balanced test set
@@ -546,26 +708,29 @@ def load_data_from_logits(config):
         split_name = split['split_name']
         base_dataset = split['base_dataset']
         indices_path = splits_dir / split['indices_file']
-        print(f"Loading data for split: {split_name}")
+        print(f"\n📊 Loading {split_name.upper()} split:")
         
         if not indices_path.exists():
             raise FileNotFoundError(f"Missing indices file: {indices_path}")
         indices = json.loads(indices_path.read_text())
+        print(f"  Indices: {len(indices)} samples")
 
-        # Stack expert logits - support both .npz (new) and .pt (old) formats
+        # Stack expert logits
         stacked_logits = torch.zeros(len(indices), num_experts, num_classes)
         for i, expert_name in enumerate(expert_names):
-            # Try .npz first (new format), then .pt (old format)
-            npz_path = logits_root / expert_name / f"{split_name}_logits.npz"
-            pt_path = logits_root / expert_name / f"{split_name}_logits.pt"
+            logits_path = logits_root / expert_name / f"{split_name}_logits.pt"
             
-            if npz_path.exists():
-                data = np.load(npz_path)
-                stacked_logits[:, i, :] = torch.from_numpy(data['logits'])
-            elif pt_path.exists():
-                stacked_logits[:, i, :] = torch.load(pt_path, map_location='cpu')
-            else:
-                raise FileNotFoundError(f"Missing logits for {expert_name} at {npz_path} or {pt_path}")
+            if not logits_path.exists():
+                raise FileNotFoundError(
+                    f"Logits not found: {logits_path}\n"
+                    f"Please ensure experts are trained with logits exported."
+                )
+            
+            logits = torch.load(logits_path, map_location='cpu')
+            if logits.dtype == torch.float16:
+                logits = logits.float()
+            stacked_logits[:, i, :] = logits
+            print(f"  ✓ {expert_name}: {logits.shape}")
 
         labels = torch.tensor(np.array(base_dataset.targets)[indices])
         dataset = TensorDataset(stacked_logits, labels)
@@ -582,10 +747,14 @@ def main():
     
     # 1) Load data
     S1_loader, S2_loader = load_data_from_logits(CONFIG)
-    print(f"✅ Loaded S1 (tuneV): {len(S1_loader)} batches")
-    print(f"✅ Loaded S2 (val_lt): {len(S2_loader)} batches")
+    print(f"\n✅ Loaded S1 (tunev): {len(S1_loader.dataset)} samples, {len(S1_loader)} batches")
+    print(f"✅ Loaded S2 (val): {len(S2_loader.dataset)} samples, {len(S2_loader)} batches")
     
-    # 2) Set up grouping
+    # 2) Load class weights for reweighting
+    class_weights = load_class_weights(CONFIG['dataset']['splits_dir'])
+    print(f"✅ Class weights loaded: min={class_weights.min():.6f}, max={class_weights.max():.6f}")
+    
+    # 3) Set up grouping
     class_counts = get_cifar100_lt_counts(imb_factor=100)
     class_to_group = get_class_to_group_by_threshold(class_counts, threshold=CONFIG['grouping']['threshold'])
     num_groups = class_to_group.max().item() + 1
@@ -593,7 +762,7 @@ def main():
     tail = (class_to_group == 1).sum().item()
     print(f"✅ Groups: {head} head classes, {tail} tail classes")
     
-    # 3) Load frozen GSE model (with pre-trained gating if available)
+    # 4) Load frozen GSE model (with pre-trained gating if available)
     num_experts = len(CONFIG['experts']['names'])
     
     # Dynamic gating feature dimension computation
@@ -678,31 +847,35 @@ def main():
         model.alpha.fill_(1.0)
         model.mu.fill_(0.0)
     
-    # 4) Cache η̃ for both splits
+    # 5) Cache η̃ for both splits
     print("\n=== Caching mixture posteriors ===")
     eta_S1, y_S1 = cache_eta_mix(model, S1_loader, class_to_group)
     eta_S2, y_S2 = cache_eta_mix(model, S2_loader, class_to_group) 
     
-    print(f"✅ Cached η̃_S1: {eta_S1.shape}, y_S1: {y_S1.shape}")
-    print(f"✅ Cached η̃_S2: {eta_S2.shape}, y_S2: {y_S2.shape}")
+    print(f"✅ Cached η̃_S1 (tunev): {eta_S1.shape}, y_S1: {y_S1.shape}")
+    print(f"✅ Cached η̃_S2 (val): {eta_S2.shape}, y_S2: {y_S2.shape}")
     
     # Optional: save cached posteriors for multiple experiments
     cache_dir = Path('./cache/eta_mix')
     cache_dir.mkdir(parents=True, exist_ok=True)
     torch.save({'eta': eta_S1, 'y': y_S1}, cache_dir / 'S1_tuneV.pt')
-    torch.save({'eta': eta_S2, 'y': y_S2}, cache_dir / 'S2_val_lt.pt')
+    torch.save({'eta': eta_S2, 'y': y_S2}, cache_dir / 'S2_val.pt')
     print(f"💾 Saved cached posteriors to {cache_dir}")
     
-    # 5) Auto-calibrate c if needed
+    # 6) Auto-calibrate c if needed
     current_c = CONFIG['plugin_params']['c']
     optimal_c = calculate_optimal_c_from_eta(eta_S1, target_coverage=0.6)
     print(f"📊 Current c={current_c:.3f}, Optimal c for 60% coverage={optimal_c:.3f}")
     
     # Use current c or switch to optimal
     
-    # 6) Run GSE-Balanced plugin with improved parameters
+    # 7) Run GSE-Balanced plugin with improved parameters and reweighting
     cov_target = CONFIG['plugin_params']['cov_target']
     objective = CONFIG['plugin_params']['objective']
+    
+    print(f"\n📊 Reweighting enabled: {class_weights is not None}")
+    if class_weights is not None:
+        print(f"   - Metrics will reflect long-tail performance on balanced data")
     
     # Check if we should use EG-outer for worst-group optimization
     if objective == 'worst' and CONFIG['plugin_params']['use_eg_outer']:
@@ -774,6 +947,7 @@ def main():
             use_conditional_alpha=CONFIG['plugin_params']['use_conditional_alpha'],
             tie_break_balanced=CONFIG['plugin_params']['tie_break_balanced'],
             use_ema_mu=CONFIG['plugin_params'].get('use_ema_mu', True),
+            class_weights=class_weights,  # Pass class weights for reweighting
         )
         # If μ was frozen, overwrite with init μ
         if selective_loaded and CONFIG['plugin_params'].get('freeze_mu', False) and 'mu_init_tensor' in locals() and mu_init_tensor is not None:
