@@ -36,12 +36,12 @@ if __name__ == '__main__':
     CONFIG['plugin_params'].update({
         'objective': 'worst',
         'use_eg_outer': True,
-        'eg_outer_T': 30,           # More iterations
-        'eg_outer_xi': 0.2,         # Reduced step size for stability
+        'eg_outer_T': 40,           # More iterations for convergence
+        'eg_outer_xi': 0.15,        # Reduced step size for stability  
         'use_conditional_alpha': True,  # Enable blended updates
-        'M': 10,                    # Inner iterations
-        'alpha_steps': 4,           # Alpha fixed-point steps
-        'gamma': 0.25,             # EMA factor
+        'M': 12,                    # Inner iterations (increased)
+        'alpha_steps': 5,           # Alpha fixed-point steps (increased)
+        'gamma': 0.20,              # EMA factor (reduced for stability)
     })
     
     # Update output directory for improved results

@@ -488,12 +488,17 @@ def update_alpha_fixed_point(eta_S1, y_S1, alpha, mu, c, class_to_group, K,
 def mu_from_lambda_grid(lambdas, K):
     """
     Convert lambda grid to mu vectors with constraint Σμ_k = 0.
-    For K=2: μ = [λ/2, -λ/2]
+    For K=2: μ = [-λ/2, +λ/2]
+    
+    Convention: 
+    - Group 0 (head): μ_0 = -λ/2 (negative → lower threshold → accept more)
+    - Group 1 (tail): μ_1 = +λ/2 (positive → higher threshold → selective)
     """
     mus = []
     for lam in lambdas:
         if K == 2:
-            mus.append(torch.tensor([+lam/2.0, -lam/2.0], dtype=torch.float32))
+            # ✅ FIX: Corrected sign convention
+            mus.append(torch.tensor([-lam/2.0, +lam/2.0], dtype=torch.float32))
         else:
             # For K>2: could use orthogonal vectors, but not implemented here
             raise NotImplementedError("Provide a mu grid for K>2")
@@ -889,11 +894,16 @@ def main():
             class_to_group.to(DEVICE), K=num_groups,
             T=CONFIG['plugin_params']['eg_outer_T'], 
             xi=CONFIG['plugin_params']['eg_outer_xi'],
-            lambda_grid=np.linspace(-1.2, 1.2, 41).tolist(),
-            M=8, alpha_steps=4, 
-            target_cov_by_group=[0.55, 0.45] if num_groups==2 else [cov_target]*num_groups,
+            lambda_grid=np.linspace(-1.5, 1.5, 41).tolist(),  # Expanded lambda grid
+            M=CONFIG['plugin_params']['M'],                    # Use config M value
+            alpha_steps=CONFIG['plugin_params']['alpha_steps'], # Use config alpha_steps  
+            target_cov_by_group=[0.56, 0.44] if num_groups==2 else [cov_target]*num_groups,  # Match selective targets
             gamma=CONFIG['plugin_params']['gamma'],
-            use_conditional_alpha=CONFIG['plugin_params']['use_conditional_alpha']  # 🔧 Fix: Use config flag
+            use_conditional_alpha=CONFIG['plugin_params']['use_conditional_alpha'],
+            beta_floor=0.02,      # Lower floor to allow more adaptation (was 0.05)
+            beta_momentum=0.20,   # Lower momentum for faster convergence (was 0.25)
+            patience=10,          # Higher patience to prevent premature stopping (was 6)
+            class_weights=class_weights  # ✅ CRITICAL: Pass class weights for reweighting!
         )
         
         

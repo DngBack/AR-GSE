@@ -33,43 +33,45 @@ CONFIG = {
         'logits_dir': './outputs/logits_fixed/',  # Updated to use recomputed logits
     },
     'gating_params': {
-        'epochs': 25,         # More epochs for better convergence
-        'batch_size': 2,
-        'lr': 8e-4,          # Slightly reduced for stability
-        'weight_decay': 2e-4, # Increased weight decay 
+        'epochs': 100,        # OPTIMIZED: More epochs with smaller batches
+        'batch_size': 64,     # OPTIMIZED: Reduced to 64 for more gradient updates (1128/64 ≈ 18 batches)
+        'lr': 5e-4,          # OPTIMIZED: Reduced LR for smaller batches
+        'weight_decay': 5e-5, # OPTIMIZED: Even less regularization
         'balanced_training': True,  # Enable tail-aware training
-        'tail_weight': 1.0,  # Even softer weighting for optimal balance
+        'tail_weight': 1.5,  # OPTIMIZED: Boost tail more for better balance
         'use_freq_weighting': True,  # Use frequency-based soft weighting
-        'entropy_penalty': 0.0000,  # Giảm entropy_penalty về 0 để tránh ép uniform
-        'diversity_penalty': 0.002,  # usage_balance nhỏ để tránh collapse
-        'gradient_clip': 0.5,  # NEW: Gradient clipping for stability
+        'entropy_penalty': 0.02,  # OPTIMIZED: Increased to encourage more diversity
+        'diversity_penalty': 0.01,  # OPTIMIZED: Doubled to prevent collapse
+        'gradient_clip': 1.0,  # Gradient clipping
+        'lr_scheduler': True,  # Enable cosine annealing scheduler
+        'warmup_epochs': 10,   # OPTIMIZED: Longer warmup for stability
     },
     'selective': {
         # Core selective parameters
         'tau': 0.70,              # global target coverage backup
-        'tau_by_group': [0.56, 0.44],  # per-group τ_k (head, tail) - updated for Pinball
+        'tau_by_group': [0.56, 0.44],  # per-group τ_k (head, tail)
         'tau_head': 0.56,         # head coverage target (for Pinball loss)
         'tau_tail': 0.44,         # tail coverage target (for Pinball loss)
-        'beta_tail': 2.0,         # tail weighting in L_sel (head=1, tail=β_tail)
-        'kappa': 25.0,            # sharpness κ for sigmoid smoothing (increased for better calibration)
-        'lambda_cov': 15.0,       # λ_cov global (legacy, kept for compatibility)
+        'beta_tail': 2.5,         # OPTIMIZED: Increased from 2.0 to 2.5 (stronger tail emphasis)
+        'kappa': 8.0,            # OPTIMIZED: Increased from 5 to 8 (sharper sigmoid for better control)
+        'lambda_cov': 15.0,       # λ_cov global (legacy)
         'lambda_cov_g': 20.0,     # λ_cov-g group coverage penalty (legacy)
-        'lambda_q': 1.0,          # λ_q for Pinball quantile loss
-        'lambda_cov_pinball': 20.0, # λ_cov for per-group coverage penalty in Pinball mode
-        'lambda_H': 0.01,         # λ_H entropy regularizer
-        'lambda_GA': 0.05,        # λ_GA group-aware prior KL
+        'lambda_q': 1.5,          # OPTIMIZED: Increased from 0.5 to 1.5 (stronger quantile learning)
+        'lambda_cov_pinball': 150.0, # OPTIMIZED: Increased from 50 to 150 (much stronger coverage enforcement)
+        'lambda_H': 0.02,         # OPTIMIZED: Increased from 0.01 to 0.02 (more gating diversity)
+        'lambda_GA': 0.08,        # OPTIMIZED: Increased from 0.05 to 0.08 (stronger prior guidance)
         # Scheduling
-        'stageA_epochs': 5,       # Stage A (warm-up) epochs (mixture CE)
-        'cycles': 6,              # M cycles (Stage B alternating)
-        'epochs_per_cycle': 3,    # B1 epochs per cycle
-        'alpha_steps': 2,         # B2 fixed-point steps for α per cycle
-        'update_alpha': True,     # Whether to run α updates (disable if relying on cov-g)
-        'use_quantile_t': True,   # Update t by quantile each epoch (else learnable not yet supported)
-        'alpha_min': 0.80,        # Expanded α range for better tail control
-        'alpha_max': 1.60,        # Wider range allows more aggressive tail boosting
-        'gamma_alpha': 0.20,      # EMA factor for α
-        # μ / λ grid search (B3)
-    'lambda_grid': [round(x,2) for x in np.linspace(-2.0,2.0,41)],
+        'stageA_epochs': 8,       # OPTIMIZED: Increased from 5 to 8 (better warm-up)
+        'cycles': 8,              # OPTIMIZED: Increased from 6 to 8 (more refinement)
+        'epochs_per_cycle': 4,    # OPTIMIZED: Increased from 3 to 4 (more updates per cycle)
+        'alpha_steps': 3,         # OPTIMIZED: Increased from 2 to 3 (smoother alpha updates)
+        'update_alpha': True,     
+        'use_quantile_t': True,   
+        'alpha_min': 0.75,        # OPTIMIZED: Narrowed from 0.80 to 0.75 (allow more tail boost)
+        'alpha_max': 1.40,        # OPTIMIZED: Narrowed from 1.60 to 1.40 (prevent extreme values)
+        'gamma_alpha': 0.15,      # OPTIMIZED: Reduced from 0.20 to 0.15 (slower, more stable alpha updates)
+        # μ / λ grid search (B3) - EXPANDED GRID
+        'lambda_grid': [round(x,2) for x in np.linspace(-3.0, 1.0, 41)],  # OPTIMIZED: Expanded to [-3, 1]
         'opt_objective': 'worst',  # 'worst' or 'balanced'
         # Priors & temperatures
         'prior_tail_boost': 1.5,
@@ -517,6 +519,9 @@ def selective_losses_with_pinball(expert_logits, labels, model, alpha, mu, t_par
     cov_head = s[y_groups == 0].mean() if (y_groups == 0).any() else torch.tensor(0., device=device)
     cov_tail = s[y_groups == 1].mean() if (y_groups == 1).any() else torch.tensor(0., device=device)
     L_cov_pinball = (cov_head - tau_head)**2 + (cov_tail - tau_tail)**2
+    
+    # Compute overall coverage for diagnostics
+    coverage_overall = s.mean()
 
     # Entropy regularizer λ_H * E[-Σ w log w]
     H_w = -(w * torch.log(w + eps)).sum(dim=1).mean()
@@ -536,8 +541,11 @@ def selective_losses_with_pinball(expert_logits, labels, model, alpha, mu, t_par
     diagnostics = {
         'L_sel': L_sel.item(), 'L_q': L_q.item(), 'L_cov_pinball': L_cov_pinball.item(),
         'L_H': L_H.item(), 'L_GA': L_GA.item(), 
+        'coverage': coverage_overall.item(),  # FIXED: Add overall coverage
         'cov_head': cov_head.item() if torch.is_tensor(cov_head) else cov_head,
         'cov_tail': cov_tail.item() if torch.is_tensor(cov_tail) else cov_tail,
+        'mean_s_head': cov_head.item() if torch.is_tensor(cov_head) else cov_head,  # Alias for compatibility
+        'mean_s_tail': cov_tail.item() if torch.is_tensor(cov_tail) else cov_tail,  # Alias for compatibility
         'entropy_w': H_w.item(), 'kl_w': KL.item(),
         't_head': t_param[0].item(), 't_tail': t_param[1].item(),
     }
@@ -660,15 +668,18 @@ def run_selective_mode():
     mu = torch.zeros(K, device=DEVICE)
     
     # Initialize learnable per-group thresholds
-    t_param = torch.nn.Parameter(torch.full((K,), -0.70, device=DEVICE))  # init near reasonable level
+    # CRITICAL FIX: Start with VERY LOW thresholds to ensure initial acceptance
+    # Raw margins are typically in range [-2, 0], so start at -1.5 to accept ~50-70% initially
+    t_param = torch.nn.Parameter(torch.full((K,), -1.5, device=DEVICE))  
     print(f"✅ Initialized learnable thresholds t_param: {t_param.tolist()}")
+    print(f"   NOTE: Low initial thresholds (-1.5) to ensure coverage > 0 at start")
 
     # Optimizer (gating params + learnable thresholds)
-    optimizer = optim.Adam(
-        list(model.gating_net.parameters()) + [t_param], 
-        lr=CONFIG['gating_params']['lr'], 
-        weight_decay=CONFIG['gating_params']['weight_decay']
-    )
+    # OPTIMIZED: Separate learning rates for gating network and thresholds
+    optimizer = optim.Adam([
+        {'params': model.gating_net.parameters(), 'lr': CONFIG['gating_params']['lr']},
+        {'params': [t_param], 'lr': CONFIG['gating_params']['lr'] * 0.5}  # Lower LR for thresholds
+    ], weight_decay=CONFIG['gating_params']['weight_decay'])
 
     # Priors π_g
     pi_by_group = build_group_priors(CONFIG['experts']['names'], K, sel_cfg['prior_head_boost'], sel_cfg['prior_tail_boost']).to(DEVICE)
@@ -781,8 +792,25 @@ def run_selective_mode():
             # Summarize epoch diagnostics
             keys = ['L_sel','coverage','mean_s_head','mean_s_tail']
             avg_diag = {k: float(np.mean([d[k] for d in epoch_diag])) for k in keys}
-            print(f"  B1 Epoch {ep+1}: t_head={t_param[0].item():.4f} t_tail={t_param[1].item():.4f} | " + 
-                  ", ".join([f"{k}={avg_diag[k]:.3f}" for k in keys]))
+            
+            # DEBUG: Show margin statistics
+            if len(raw_collect) > 0:
+                all_margins = torch.cat(raw_collect)
+                margin_stats = {
+                    'min': all_margins.min().item(),
+                    'max': all_margins.max().item(), 
+                    'mean': all_margins.mean().item(),
+                    'q25': torch.quantile(all_margins, 0.25).item(),
+                    'q50': torch.quantile(all_margins, 0.50).item(),
+                    'q75': torch.quantile(all_margins, 0.75).item(),
+                }
+                print(f"  B1 Epoch {ep+1}: t_head={t_param[0].item():.4f} t_tail={t_param[1].item():.4f} | " + 
+                      ", ".join([f"{k}={avg_diag[k]:.3f}" for k in keys]))
+                print(f"    Margins: min={margin_stats['min']:.3f} mean={margin_stats['mean']:.3f} " +
+                      f"q50={margin_stats['q50']:.3f} max={margin_stats['max']:.3f}")
+            else:
+                print(f"  B1 Epoch {ep+1}: t_head={t_param[0].item():.4f} t_tail={t_param[1].item():.4f} | " + 
+                      ", ".join([f"{k}={avg_diag[k]:.3f}" for k in keys]))
 
         # Cache η for S1/S2 for α & μ updates
         def cache_eta(loader):
@@ -807,15 +835,32 @@ def run_selective_mode():
             print(f"  Updated α: {alpha.tolist()}")
 
         # B3: sweep μ via λ grid on S2 (use learned thresholds t_param)
+        # OPTIMIZED: Add early stopping when no improvement
         mu_best_local = mu.clone()
         score_best_local = float('inf')
+        no_improvement_count = 0
+        early_stop_patience = 10  # Stop if no improvement for 10 consecutive lambdas
+        
         for j, mu_cand in enumerate(mu_candidates):
             # Use current learned thresholds directly - no fitting needed
             score, group_errs = evaluate_split_with_learned_thresholds(eta_S2, y_S2, alpha, mu_cand, t_param, class_to_group.to(DEVICE), K, objective=sel_cfg['opt_objective'])
-            print(f"  λ[{lambda_grid[j]:.2f}] -> {sel_cfg['opt_objective']} err={score:.4f} t_h={t_param[0].item():.4f} t_t={t_param[1].item():.4f} | groups={['{:.3f}'.format(e) for e in group_errs]}")
+            
+            # Only print every 5th lambda to reduce clutter
+            if j % 5 == 0 or score < score_best_local - 1e-6:
+                print(f"  λ[{lambda_grid[j]:.2f}] -> {sel_cfg['opt_objective']} err={score:.4f} t_h={t_param[0].item():.4f} t_t={t_param[1].item():.4f} | groups={['{:.3f}'.format(e) for e in group_errs]}")
+            
             if score < score_best_local - 1e-6:
                 score_best_local = score
                 mu_best_local = mu_cand.clone()
+                no_improvement_count = 0
+            else:
+                no_improvement_count += 1
+                
+            # Early stopping if no improvement
+            if no_improvement_count >= early_stop_patience:
+                print(f"  Early stopping at λ[{lambda_grid[j]:.2f}] (no improvement for {early_stop_patience} steps)")
+                break
+                
         # EMA stabilize μ after sweeping candidates
         mu = 0.5 * mu + 0.5 * mu_best_local
         print(f"  Selected μ={mu.tolist()} (score={score_best_local:.4f})")
@@ -831,11 +876,25 @@ def run_selective_mode():
             'final_alpha': alpha.tolist(),
             'final_mu': mu.tolist(), 
             'best_score': score_best_local,
-            'global_best': best_score
+            'global_best': best_score,
+            'final_thresholds': [t_param[0].item(), t_param[1].item()],
+            'final_coverage': {'head': avg_diag.get('mean_s_head', 0.0), 'tail': avg_diag.get('mean_s_tail', 0.0)}
         })
         cycle_logs.append(cycle_diag)
         
+        # Enhanced cycle summary
         print(f"  End Cycle {cycle+1}: best_score_so_far={best_score:.4f}")
+        print(f"  └─ Coverage: head={cycle_diag['final_coverage']['head']:.3f} (target=0.56), " +
+              f"tail={cycle_diag['final_coverage']['tail']:.3f} (target=0.44)")
+        print(f"  └─ Alpha: head={alpha[0]:.3f}, tail={alpha[1]:.3f}")
+        print(f"  └─ Thresholds: head={t_param[0].item():.4f}, tail={t_param[1].item():.4f}")
+        
+        # Check convergence - stop early if no improvement for 2 cycles
+        if cycle >= 2:
+            recent_scores = [cycle_logs[-2]['best_score'], cycle_logs[-1]['best_score']]
+            if abs(recent_scores[-1] - recent_scores[-2]) < 1e-4:
+                print(f"\n⚠️  Early convergence detected (improvement < 1e-4). Stopping at cycle {cycle+1}/{sel_cfg['cycles']}")
+                break
 
     # Save checkpoint with learned thresholds
     output_dir = Path(CONFIG['output']['checkpoints_dir']) / CONFIG['dataset']['name']
@@ -917,8 +976,22 @@ def train_gating_only():
         weight_decay=CONFIG['gating_params']['weight_decay']
     )
     
+    # Add learning rate scheduler with warmup
+    total_epochs = CONFIG['gating_params']['epochs']
+    warmup_epochs = CONFIG['gating_params'].get('warmup_epochs', 5)
+    
+    if CONFIG['gating_params'].get('lr_scheduler', False):
+        # Cosine annealing with warmup
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_epochs - warmup_epochs, eta_min=1e-5
+        )
+        print(f"✅ Using CosineAnnealingLR scheduler with {warmup_epochs} warmup epochs")
+    else:
+        scheduler = None
+    
     # Training loop with optional balanced training
     best_loss = float('inf')
+    best_epoch = 0
     
     # Set up class grouping for balanced training
     if CONFIG['gating_params']['balanced_training']:
@@ -938,7 +1011,16 @@ def train_gating_only():
     for epoch in range(CONFIG['gating_params']['epochs']):
         model.train()
         total_loss = 0.0
+        total_ce_loss = 0.0
+        total_entropy_loss = 0.0
+        total_diversity_loss = 0.0
         num_batches = 0
+        
+        # Warmup learning rate
+        if epoch < warmup_epochs:
+            lr_scale = (epoch + 1) / warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = CONFIG['gating_params']['lr'] * lr_scale
         
         for batch_idx, (expert_logits, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}")):
             expert_logits = expert_logits.to(DEVICE)
@@ -982,11 +1064,18 @@ def train_gating_only():
             num_batches += 1
             
         avg_loss = total_loss / num_batches
-        print(f"Epoch {epoch+1}/{CONFIG['gating_params']['epochs']} | Loss: {avg_loss:.4f}")
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Step scheduler after warmup
+        if scheduler is not None and epoch >= warmup_epochs:
+            scheduler.step()
+        
+        print(f"Epoch {epoch+1}/{CONFIG['gating_params']['epochs']} | Loss: {avg_loss:.4f} | LR: {current_lr:.6f}")
         
         # Save best model
         if avg_loss < best_loss:
             best_loss = avg_loss
+            best_epoch = epoch + 1
             
             output_dir = Path(CONFIG['output']['checkpoints_dir']) / CONFIG['dataset']['name']
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1002,9 +1091,12 @@ def train_gating_only():
             
             ckpt_path = output_dir / 'gating_pretrained.ckpt'
             torch.save(checkpoint, ckpt_path)
-            print(f"💾 New best! Saved to {ckpt_path}")
+            print(f"💾 New best at epoch {best_epoch}! Loss: {best_loss:.4f} | Saved to {ckpt_path}")
     
-    print(f"✅ Gating training complete. Best loss: {best_loss:.4f}")
+    print(f"\n✅ Gating training complete!")
+    print(f"   Best epoch: {best_epoch}/{total_epochs}")
+    print(f"   Best loss: {best_loss:.4f}")
+    print(f"   Final LR: {optimizer.param_groups[0]['lr']:.6f}")
 
 def parse_args():
     import argparse
