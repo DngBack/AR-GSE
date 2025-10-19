@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 AR-GSE Paper Analysis and Figure Generation
 This script creates comprehensive analysis for the paper including:
@@ -8,13 +9,19 @@ This script creates comprehensive analysis for the paper including:
 - Performance tables
 """
 
+import sys
+import os
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
+# import seaborn as sns  # Unused, keeping for future plots
 import pandas as pd
 from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
+
+# Set encoding for Windows compatibility
+if sys.stdout.encoding != 'utf-8':
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
 
 # Paper-quality plot settings
 plt.rcParams.update({
@@ -37,13 +44,13 @@ def create_paper_figures():
     output_dir = Path("paper_analysis")
     output_dir.mkdir(exist_ok=True)
     
-    print("🎨 Creating AR-GSE Paper Figures")
+    print(">>> Creating AR-GSE Paper Figures")
     print("=" * 40)
     
     # ==============================================
     # FIGURE 1: COVERAGE GAP ANALYSIS (C1)
     # ==============================================
-    print("📊 Figure 1: Coverage Gap Analysis (C1)")
+    print(">> Figure 1: Coverage Gap Analysis (C1)")
     
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     
@@ -110,7 +117,7 @@ def create_paper_figures():
     # ==============================================
     # FIGURE 2: OPTIMIZATION STABILITY (C2)
     # ==============================================
-    print("📊 Figure 2: Optimization Stability (C2)")
+    print(">> Figure 2: Optimization Stability (C2)")
     
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
     
@@ -126,9 +133,9 @@ def create_paper_figures():
     full_method = base_curve * 0.85 + 0.002 * np.sin(epochs/12) * np.exp(-epochs/80)
     
     ax1.plot(epochs, primal_dual, 'r-', linewidth=2, label='Primal-Dual', alpha=0.8)
-    ax1.plot(epochs, fp_alpha, 'orange', linewidth=2, label='+ Fixed-Point α', alpha=0.8)
-    ax1.plot(epochs, fp_eg, 'green', linewidth=2, label='+ FP-α + EG-μ', alpha=0.8)
-    ax1.plot(epochs, full_method, 'purple', linewidth=3, label='+ β-floor (Ours)', alpha=0.9)
+    ax1.plot(epochs, fp_alpha, 'orange', linewidth=2, label='+ Fixed-Point alpha', alpha=0.8)
+    ax1.plot(epochs, fp_eg, 'green', linewidth=2, label='+ FP-alpha + EG-mu', alpha=0.8)
+    ax1.plot(epochs, full_method, 'purple', linewidth=3, label='+ beta-floor (Ours)', alpha=0.9)
     
     ax1.set_title('Worst-Group Error Convergence', fontweight='bold')
     ax1.set_xlabel('Epoch')
@@ -141,8 +148,8 @@ def create_paper_figures():
     window = 10
     stability_data = {
         'Primal-Dual': 0.028,
-        '+FP-α': 0.021, 
-        '+FP-α+EG-μ': 0.015,
+        '+FP-alpha': 0.021, 
+        '+FP-alpha+EG-mu': 0.015,
         'Ours (Full)': 0.008
     }
     
@@ -180,7 +187,7 @@ def create_paper_figures():
     
     bars = ax4.bar(methods, final_aurc, yerr=final_std, capsize=4,
                   color=colors, alpha=0.8, edgecolor='black', linewidth=0.5)
-    ax4.set_title('Final AURC (Worst) ± Std', fontweight='bold')
+    ax4.set_title('Final AURC (Worst) +/- Std', fontweight='bold')
     ax4.set_ylabel('AURC (Worst)')
     ax4.tick_params(axis='x', rotation=15)
     ax4.grid(True, alpha=0.3)
@@ -193,7 +200,7 @@ def create_paper_figures():
     # ==============================================
     # FIGURE 3: EXPERT GATING ANALYSIS (C3) 
     # ==============================================
-    print("📊 Figure 3: Expert Gating Analysis (C3)")
+    print(">> Figure 3: Expert Gating Analysis (C3)")
     
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
     
@@ -222,7 +229,7 @@ def create_paper_figures():
     
     # Plot heatmap
     im = ax1.imshow(expert_usage.T, aspect='auto', cmap='viridis', vmin=0, vmax=0.8)
-    ax1.set_title('Expert Usage by Class (Head → Tail)', fontweight='bold')
+    ax1.set_title('Expert Usage by Class (Head to Tail)', fontweight='bold')
     ax1.set_xlabel('Class ID')
     ax1.set_ylabel('Expert')
     ax1.set_yticks([0, 1, 2])
@@ -300,7 +307,7 @@ def create_paper_figures():
     # ==============================================
     # FIGURE 4: HERO RC CURVES (MAIN RESULT)
     # ==============================================
-    print("📊 Figure 4: Hero RC Curves (Main Result)")
+    print(">> Figure 4: Hero RC Curves (Main Result)")
     
     coverage = np.linspace(0.2, 1.0, 50)
     
@@ -381,7 +388,7 @@ def create_paper_figures():
     # ==============================================
     # CREATE SUPPORTING TABLES
     # ==============================================
-    print("📋 Creating Supporting Tables")
+    print(">> Creating Supporting Tables")
     
     # Main results table
     methods = ['AR-GSE (Ours)', 'Standard Plugin', 'Static Ensemble', 
@@ -408,7 +415,7 @@ def create_paper_figures():
     }
     
     c2_ablation = {
-        'Component': ['Primal-Dual Only', '+ Fixed-Point α', '+ FP-α + EG-μ', '+ β-floor (Full)'],
+        'Component': ['Primal-Dual Only', '+ Fixed-Point alpha', '+ FP-alpha + EG-mu', '+ beta-floor (Full)'],
         'AURC_Balanced': [0.134, 0.128, 0.121, 0.118],
         'AURC_Worst': [0.182, 0.165, 0.148, 0.142],
         'Tail_Collapse_Rate': [0.32, 0.18, 0.08, 0.02],
@@ -437,7 +444,7 @@ def create_paper_figures():
     
     summary = f"""# AR-GSE Paper Analysis Summary
 
-## 📊 Generated Figures
+## Generated Figures
 
 ### Figure 1: Coverage Gap Analysis (C1 Contribution)
 - **File**: `figure_1_coverage_gap_analysis.pdf`
@@ -449,12 +456,12 @@ def create_paper_figures():
 - **File**: `figure_2_optimization_stability.pdf`
 - **Shows**: Training stability with different optimization components
 - **Key Result**: Tail collapse rate reduced from 32% to 2%
-- **Variance**: Training variance improved by 3.5× (0.028 → 0.008)
+- **Variance**: Training variance improved by 3.5x (0.028 to 0.008)
 
 ### Figure 3: Expert Gating Analysis (C3 Contribution)
 - **File**: `figure_3_expert_gating_analysis.pdf`  
 - **Shows**: Expert specialization and calibration improvements
-- **Key Result**: ECE improved by 67% (0.085 → 0.028)
+- **Key Result**: ECE improved by 67% (0.085 to 0.028)
 - **Specialization**: LogitAdjust 50% usage on tail vs CE 20%
 
 ### Figure 4: Hero RC Curves (Main Result)
@@ -463,7 +470,7 @@ def create_paper_figures():
 - **Key Result**: Consistent superiority in 60-90% coverage region
 - **Performance**: 12.6% balanced, 23.2% worst-group improvement
 
-## 📋 Generated Tables
+## Generated Tables
 
 ### Main Results (`table_main_results.csv`)
 - Complete performance comparison across all methods
@@ -475,26 +482,26 @@ def create_paper_figures():
 - `table_c2_ablation.csv`: Optimization stability components  
 - `table_c3_ablation.csv`: Expert gating and calibration components
 
-## 🔢 Key Numbers for Paper
+## Key Numbers for Paper
 
 ### Abstract/Introduction
-- "23% improvement in worst-group AURC (0.185 → 0.142)"
+- "23% improvement in worst-group AURC (0.185 to 0.142)"
 - "Coverage gap reduced from 12% to 1.5%"  
-- "67% calibration improvement (ECE: 0.085 → 0.028)"
-- "16× reduction in tail collapse rate (32% → 2%)"
+- "67% calibration improvement (ECE: 0.085 to 0.028)"
+- "16x reduction in tail collapse rate (32% to 2%)"
 
 ### Results Section
-- **AURC Balanced**: 0.118 ± 0.003 (vs 0.135 best baseline)
-- **AURC Worst**: 0.142 ± 0.005 (vs 0.185 best baseline)
+- **AURC Balanced**: 0.118 +/- 0.003 (vs 0.135 best baseline)
+- **AURC Worst**: 0.142 +/- 0.005 (vs 0.185 best baseline)
 - **Head Coverage**: 0.561 (target: 0.56, gap: 0.1%)
 - **Tail Coverage**: 0.442 (target: 0.44, gap: 0.2%)
 
 ### Method Contributions
 - **C1**: Group-wise thresholds learned via pinball loss
-- **C2**: Stable optimization (FP-α + EG-μ + β-floor)  
+- **C2**: Stable optimization (FP-alpha + EG-mu + beta-floor)  
 - **C3**: Calibrated expert gating with 24D features
 
-## 📝 LaTeX Integration
+## LaTeX Integration
 
 All figures saved as both PDF (vector) and PNG (raster).
 Recommended usage:
@@ -507,12 +514,12 @@ Figure widths:
 
 Files ready for \\includegraphics in LaTeX.
 
-## 🎯 Paper Structure Mapping
+## Paper Structure Mapping
 
-### Introduction → Figure 4 (Hero curves)
-### Method Section → Figures 1-3 (Contributions)  
-### Results Section → Figure 4 + Tables
-### Ablation Section → Tables + Figure components
+### Introduction to Figure 4 (Hero curves)
+### Method Section to Figures 1-3 (Contributions)  
+### Results Section to Figure 4 + Tables
+### Ablation Section to Tables + Figure components
 
 Generated {len(list(output_dir.iterdir()))} files total.
 """
@@ -520,34 +527,34 @@ Generated {len(list(output_dir.iterdir()))} files total.
     with open(output_dir / 'README_analysis.md', 'w') as f:
         f.write(summary)
     
-    print(f"\n✅ All figures and tables generated!")
-    print(f"📁 Output directory: {output_dir.absolute()}")
-    print(f"📄 Generated {len(list(output_dir.iterdir()))} files")
+    print("\n[SUCCESS] All figures and tables generated!")
+    print(f">> Output directory: {output_dir.absolute()}")
+    print(f">> Generated {len(list(output_dir.iterdir()))} files")
     
     return output_dir
 
 def main():
     """Main function to run the analysis."""
-    print("🚀 AR-GSE Paper Analysis Generator")
+    print(">>> AR-GSE Paper Analysis Generator")
     print("=" * 50)
     
     try:
         output_dir = create_paper_figures()
         
-        print("\n🎉 Success! Paper analysis complete.")
-        print("\n📂 Generated files:")
+        print("\n[SUCCESS] Paper analysis complete.")
+        print("\n>> Generated files:")
         for file_path in sorted(output_dir.iterdir()):
             print(f"   - {file_path.name}")
             
-        print(f"\n📖 See {output_dir}/README_analysis.md for detailed descriptions.")
-        print("\n🔍 Next steps:")
+        print(f"\n>> See {output_dir}/README_analysis.md for detailed descriptions.")
+        print("\n>> Next steps:")
         print("1. Review the generated figures")  
         print("2. Use PDF files in your LaTeX paper")
         print("3. Reference the tables for exact numbers")
         print("4. Check README for figure captions and key results")
         
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"[ERROR] {e}")
         print("Please install required packages: matplotlib, seaborn, pandas, numpy")
 
 if __name__ == "__main__":

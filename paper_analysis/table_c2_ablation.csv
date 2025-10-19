@@ -1,0 +1,5 @@
+Component,AURC_Balanced,AURC_Worst,Tail_Collapse_Rate,Training_Variance,Convergence_Epochs
+Primal-Dual Only,0.134,0.182,0.32,0.028,95
++ Fixed-Point alpha,0.128,0.165,0.18,0.021,78
++ FP-alpha + EG-mu,0.121,0.148,0.08,0.015,62
++ beta-floor (Full),0.118,0.142,0.02,0.008,45

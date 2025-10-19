@@ -1,0 +1,5 @@
+Component,ECE,AURC_Balanced,AURC_Worst,Expert_Collapse_Rate,Gating_Entropy_Mean
+No Temp Scaling,0.085,0.142,0.175,0.25,0.45
+No KL Prior,0.042,0.125,0.158,0.15,0.68
+No Entropy Reg,0.038,0.122,0.152,0.12,0.72
+Full System (Ours),0.028,0.118,0.142,0.02,0.85

@@ -607,9 +607,9 @@ def main():
     print(f"   • Difference:     {diff:.6f}")
     if worst_aurc > balanced_aurc:
         print(f"   ⚠️  Worst-group error is {((worst_aurc/balanced_aurc - 1)*100):.1f}% higher than balanced")
-        print(f"   → Indicates group disparity in performance")
+        print("   → Indicates group disparity in performance")
     else:
-        print(f"   ✅ Groups are relatively balanced")
+        print("   ✅ Groups are relatively balanced")
     
     print("="*60)
     if class_weights:
