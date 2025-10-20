@@ -392,212 +392,113 @@ def compute_aurc_from_points(rc_points, coverage_range='full'):
 #############################################
 
 def plot_aurc_curves(all_rc_points, aurc_results, save_path):
-    """Plot risk vs rejection curves (following AR-GSE paper Figure 3 style)."""
-    plt.figure(figsize=(16, 5))
-    
-    # Colors for balanced and worst metrics (matching paper style)
-    colors = {'balanced': 'green', 'worst': 'orange'}
-    linestyles = {'balanced': '-', 'worst': '-'}
-    markers = {'balanced': 'v', 'worst': 'x'}
-    
-    # Import for interpolation
+    """Plot rejection-based curves and grouped AURC comparisons.
+
+    Layout (1 row, 3 columns):
+      1. Error vs Proportion of Rejections (Full 0-1)
+      2. Error vs Proportion of Rejections (Zoom 0-0.8)
+      3. Grouped bar chart: Full-range AURC vs Practical (0.2-1.0) for each metric.
+    """
     from scipy.interpolate import interp1d
-    
-    # Full range plot (X-axis: Proportion of Rejections)
-    plt.subplot(1, 3, 1)
+    colors = {'balanced': 'green', 'worst': 'orange'}
+    markers = {'balanced': 'v', 'worst': 'x'}
+    linestyles = {'balanced': '-', 'worst': '-'}
+
+    plt.figure(figsize=(18, 5))
+
+    # ---- Subplot 1: Full range rejection 0-1 ----
+    ax1 = plt.subplot(1, 3, 1)
     for metric, rc_points in all_rc_points.items():
         rc_points = sorted(rc_points, key=lambda x: x[1])
         coverages = np.array([p[1] for p in rc_points])
         risks = np.array([p[2] for p in rc_points])
-        
-        # Convert coverage to rejection rate
-        rejection_rates = 1.0 - coverages
-        
-        aurc = aurc_results[metric]
-        
-        # Plot original points
-        plt.scatter(rejection_rates, risks, color=colors[metric], s=50, marker=markers[metric], 
-                   edgecolor='white', linewidth=2, zorder=5, alpha=0.8)
-        
-        # Add smooth interpolation if we have enough points
-        if len(rejection_rates) >= 3:
+        rejection = 1.0 - coverages
+        aurc_full = aurc_results[metric]
+        ax1.scatter(rejection, risks, color=colors[metric], s=40, marker=markers[metric],
+                    edgecolor='white', linewidth=1.5, zorder=5, alpha=0.85)
+        if len(rejection) >= 4:
             try:
-                # Sort by rejection rate for interpolation
-                sort_idx = np.argsort(rejection_rates)
-                rejection_sorted = rejection_rates[sort_idx]
-                risks_sorted = risks[sort_idx]
-                
-                f = interp1d(rejection_sorted, risks_sorted, kind='cubic', fill_value='extrapolate')
-                rejection_smooth = np.linspace(rejection_sorted.min(), rejection_sorted.max(), 200)
-                risks_smooth = f(rejection_smooth)
-                
-                plt.plot(rejection_smooth, risks_smooth, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=2.5,
-                        label=f'{metric.title()} (AURC={aurc:.4f})', alpha=0.9)
+                idx = np.argsort(rejection)
+                f = interp1d(rejection[idx], risks[idx], kind='cubic', fill_value='extrapolate')
+                rej_smooth = np.linspace(rejection.min(), rejection.max(), 250)
+                risk_smooth = f(rej_smooth)
+                ax1.plot(rej_smooth, risk_smooth, color=colors[metric], linestyle=linestyles[metric],
+                         linewidth=2.2, label=f"{metric.title()} (AURC={aurc_full:.4f})")
             except Exception:
-                plt.plot(rejection_rates, risks, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=2.5,
-                        label=f'{metric.title()} (AURC={aurc:.4f})')
-                
+                ax1.plot(rejection, risks, color=colors[metric], linestyle=linestyles[metric],
+                         linewidth=2.2, label=f"{metric.title()} (AURC={aurc_full:.4f})")
         else:
-            plt.plot(rejection_rates, risks, color=colors[metric], 
-                    linestyle=linestyles[metric], linewidth=2.5,
-                    label=f'{metric.title()} (AURC={aurc:.4f})')
-    
-    plt.xlabel('Proportion of Rejections', fontsize=12, fontweight='bold')
-    plt.ylabel('Error', fontsize=12, fontweight='bold')
-    plt.title('Error vs Rejection Rate (Full Range)', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3, linestyle='--')
-    plt.legend(fontsize=11, loc='best')
-    plt.xlim(0, 1)
-    plt.ylim(0, None)
-    
-    # Focused range plot (rejection rate 0.0-0.8, equivalent to coverage 0.2-1.0)
-    plt.subplot(1, 3, 2)
+            ax1.plot(rejection, risks, color=colors[metric], linestyle=linestyles[metric],
+                     linewidth=2.2, label=f"{metric.title()} (AURC={aurc_full:.4f})")
+    ax1.set_xlabel('Proportion of Rejections', fontweight='bold')
+    ax1.set_ylabel('Error', fontweight='bold')
+    ax1.set_title('Error vs Rejection Rate (0-1)', fontweight='bold')
+    ax1.grid(alpha=0.3, linestyle='--')
+    ax1.set_xlim(0, 1)
+    ax1.legend(fontsize=10)
+
+    # ---- Subplot 2: Zoom rejection 0-0.8 ----
+    ax2 = plt.subplot(1, 3, 2)
     for metric, rc_points in all_rc_points.items():
         rc_points = sorted(rc_points, key=lambda x: x[1])
         coverages = np.array([p[1] for p in rc_points])
         risks = np.array([p[2] for p in rc_points])
-        
-        # Convert coverage to rejection rate
-        rejection_rates = 1.0 - coverages
-        
-        # Plot points
-        plt.scatter(rejection_rates, risks, color=colors[metric], s=50, marker=markers[metric],
-                   edgecolor='white', linewidth=2, zorder=5, alpha=0.8)
-        
-        # Add smooth interpolation (same as first plot)
-        if len(rejection_rates) >= 3:
+        rejection = 1.0 - coverages
+        ax2.scatter(rejection, risks, color=colors[metric], s=40, marker=markers[metric],
+                    edgecolor='white', linewidth=1.5, zorder=5, alpha=0.85)
+        if len(rejection) >= 4:
             try:
-                # Sort by rejection rate for interpolation
-                sort_idx = np.argsort(rejection_rates)
-                rejection_sorted = rejection_rates[sort_idx]
-                risks_sorted = risks[sort_idx]
-                
-                f = interp1d(rejection_sorted, risks_sorted, kind='cubic', fill_value='extrapolate')
-                rejection_smooth = np.linspace(rejection_sorted.min(), rejection_sorted.max(), 200)
-                risks_smooth = f(rejection_smooth)
-                
-                plt.plot(rejection_smooth, risks_smooth, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=2.5,
-                        label=f'{metric.title()}', alpha=0.9)
+                idx = np.argsort(rejection)
+                f = interp1d(rejection[idx], risks[idx], kind='cubic', fill_value='extrapolate')
+                rej_smooth = np.linspace(rejection.min(), min(0.8, rejection.max()), 200)
+                risk_smooth = f(rej_smooth)
+                ax2.plot(rej_smooth, risk_smooth, color=colors[metric], linestyle=linestyles[metric],
+                         linewidth=2.2, label=metric.title())
             except Exception:
-                plt.plot(rejection_rates, risks, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=2.5,
-                        label=f'{metric.title()}')
-                
+                ax2.plot(rejection, risks, color=colors[metric], linestyle=linestyles[metric],
+                         linewidth=2.2, label=metric.title())
         else:
-            plt.plot(rejection_rates, risks, color=colors[metric], 
-                    linestyle=linestyles[metric], linewidth=2.5,
-                    label=f'{metric.title()}')
-    
-    plt.xlabel('Proportion of Rejections', fontsize=12, fontweight='bold')
-    plt.ylabel('Error', fontsize=12, fontweight='bold')
-    plt.title('Error vs Rejection Rate (0.0-0.8)', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3, linestyle='--')
-    plt.legend(fontsize=11, loc='best')
-    plt.xlim(0.0, 0.8)  # Rejection rate 0-0.8 (equivalent to coverage 0.2-1.0)
-    plt.ylim(0, None)
-    
-    # Enhanced AURC comparison bar plot
-    plt.subplot(1, 3, 3)
-    metrics = list(aurc_results.keys())
-    # Filter to only show full range AURC (not _02_10 versions)
-    main_metrics = [m for m in metrics if not m.endswith('_02_10')]
-    aurcs = [aurc_results[m] for m in main_metrics]
-    
-    bar_colors = [colors[m] for m in main_metrics]
-    bars = plt.bar(main_metrics, aurcs, color=bar_colors, alpha=0.7, edgecolor='black', linewidth=2, width=0.5)
-    plt.ylabel('AURC Value', fontsize=12, fontweight='bold')
-    plt.title('AURC Comparison (Full Range)', fontsize=14, fontweight='bold')
-    plt.xticks(rotation=0, fontsize=11)
-    plt.grid(True, alpha=0.3, axis='y', linestyle='--')
-    
-    # Add value labels on bars with better positioning
-    for bar, aurc in zip(bars, aurcs):
-        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(aurcs)*0.01,
-                f'{aurc:.4f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
-    
-    # Add percentage difference annotation
-    if len(aurcs) == 2:
-        balanced_aurc, worst_aurc = aurcs[0], aurcs[1]
-        diff_pct = ((worst_aurc - balanced_aurc) / balanced_aurc) * 100
-        plt.text(0.5, max(aurcs) * 0.5, f'Worst is {diff_pct:.1f}%\nhigher than Balanced', 
-                ha='center', va='center', fontsize=10, 
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.5))
-    
+            ax2.plot(rejection, risks, color=colors[metric], linestyle=linestyles[metric],
+                     linewidth=2.2, label=metric.title())
+    ax2.set_xlabel('Proportion of Rejections', fontweight='bold')
+    ax2.set_ylabel('Error', fontweight='bold')
+    ax2.set_title('Error vs Rejection Rate (0-0.8)', fontweight='bold')
+    ax2.grid(alpha=0.3, linestyle='--')
+    ax2.set_xlim(0, 0.8)
+    ax2.legend(fontsize=10)
+
+    # ---- Subplot 3: Grouped AURC bars (Full vs 0.2-1.0) ----
+    ax3 = plt.subplot(1, 3, 3)
+    metrics_main = [m for m in aurc_results.keys() if not m.endswith('_02_10')]
+    full_values = [aurc_results[m] for m in metrics_main]
+    practical_values = [aurc_results[f"{m}_02_10"] for m in metrics_main]
+    x = np.arange(len(metrics_main))
+    width = 0.35
+    bars1 = ax3.bar(x - width/2, full_values, width, label='Full (0-1)', color=[colors[m] for m in metrics_main], alpha=0.75, edgecolor='black')
+    bars2 = ax3.bar(x + width/2, practical_values, width, label='Practical (0.2-1.0)', color=[colors[m] for m in metrics_main], alpha=0.45, edgecolor='black', hatch='//')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels([m.title() for m in metrics_main], fontweight='bold')
+    ax3.set_ylabel('AURC', fontweight='bold')
+    ax3.set_title('AURC Comparison (Full vs 0.2-1.0)', fontweight='bold')
+    ax3.grid(alpha=0.3, axis='y', linestyle='--')
+    # Value labels
+    for bar in bars1:
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(full_values)*0.015,
+                 f"{bar.get_height():.4f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
+    for bar in bars2:
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(practical_values)*0.015,
+                 f"{bar.get_height():.4f}", ha='center', va='bottom', fontsize=9)
+    # Difference annotation (worst vs balanced full)
+    if len(metrics_main) == 2:
+        diff_pct = ((full_values[1] - full_values[0]) / full_values[0]) * 100
+        ax3.text(0.5, max(full_values + practical_values) * 0.75,
+                 f"Worst full AURC +{diff_pct:.1f}% vs Balanced", ha='center', va='center',
+                 fontsize=10, bbox=dict(boxstyle='round,pad=0.4', facecolor='yellow', alpha=0.5))
+    ax3.legend(fontsize=10)
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f">> Saved AURC plots (Rejection-based) to {save_path}")
-    
-    # Focused range plot (0.2-1.0) - Simple zoom of the same data
-    plt.subplot(1, 3, 2)
-    for metric, rc_points in all_rc_points.items():
-        rc_points = sorted(rc_points, key=lambda x: x[1])
-        coverages = np.array([p[1] for p in rc_points])
-        risks = np.array([p[2] for p in rc_points])
-        
-        # Plot exactly the same data as the first plot, just zoomed in
-        # Plot points
-        plt.scatter(coverages, risks, color=colors[metric], s=50, marker=markers[metric],
-                   edgecolor='white', linewidth=2, zorder=5, alpha=0.8)
-        
-        # Add smooth interpolation (same as first plot)
-        if len(coverages) >= 3:
-            try:
-                f = interp1d(coverages, risks, kind='cubic', bounds_error=False, fill_value='extrapolate')
-                coverage_smooth = np.linspace(coverages.min(), coverages.max(), 100)
-                risks_smooth = f(coverage_smooth)
-                risks_smooth = np.clip(risks_smooth, 0, 1)
-                plt.plot(coverage_smooth, risks_smooth, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=2.5, alpha=0.7,
-                        label=f'{metric.title()}')
-            except Exception:
-                plt.plot(coverages, risks, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=3,
-                        label=f'{metric.title()}')
-        else:
-            plt.plot(coverages, risks, color=colors[metric], 
-                    linestyle=linestyles[metric], linewidth=3,
-                    label=f'{metric.title()}')
-    
-    plt.xlabel('Coverage (Fraction Accepted)', fontsize=12)
-    plt.ylabel('Risk (Error on Accepted)', fontsize=12)
-    plt.title('Risk-Coverage Curves (0.2-1.0)', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=11)
-    plt.xlim(0.2, 1.0)  # Simply zoom to 0.2-1.0 range
-    plt.ylim(0, None)
-    
-    # Enhanced AURC comparison bar plot
-    plt.subplot(1, 3, 3)
-    metrics = list(aurc_results.keys())
-    # Filter to only show full range AURC (not _02_10 versions)
-    main_metrics = [m for m in metrics if not m.endswith('_02_10')]
-    aurcs = [aurc_results[m] for m in main_metrics]
-    
-    bar_colors = [colors[m] for m in main_metrics]
-    bars = plt.bar(main_metrics, aurcs, color=bar_colors, alpha=0.8, edgecolor='black', linewidth=2, width=0.6)
-    plt.ylabel('AURC Value', fontsize=12)
-    plt.title('AURC Comparison (Full Range)', fontsize=14, fontweight='bold')
-    plt.xticks(rotation=0, fontsize=11)
-    
-    # Add value labels on bars with better positioning
-    for bar, aurc in zip(bars, aurcs):
-        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(aurcs)*0.01,
-                f'{aurc:.4f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
-    
-    # Add percentage difference annotation
-    if len(aurcs) == 2:
-        balanced_aurc, worst_aurc = aurcs[0], aurcs[1]
-        diff_pct = ((worst_aurc - balanced_aurc) / balanced_aurc) * 100
-        plt.text(0.5, max(aurcs) * 0.5, f'Worst is {diff_pct:.1f}%\nhigher than Balanced', 
-                ha='center', va='center', fontsize=10, 
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f">> Saved enhanced AURC plots to {save_path}")
+    print(f">> Saved AURC plots to {save_path}")
 
 def main():
     # Reproducibility
