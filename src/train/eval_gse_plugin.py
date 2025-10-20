@@ -60,7 +60,16 @@ CONFIG = {
         'cost_values_detailed': [0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.88, 0.91, 0.93, 0.95, 0.96, 0.97, 0.98, 0.99, 0.995],
         'cost_values_full': list(np.linspace(0.0, 1.0, 41)),
         
-        'metrics': ['balanced', 'worst'],  # Focus on group-aware metrics only
+            # Dynamic sweep settings
+            # If use_dynamic_threshold_sweep=True we ignore cost_values_* and build a threshold grid
+            # directly from validation raw margins so that coverage spans (approx) [target_min_coverage, ~1.0].
+            'use_dynamic_threshold_sweep': True,
+            'target_min_coverage': 0.05,   # lowest coverage point to include (strict end)
+            'num_sweep_points_full': 61,    # points for full dynamic sweep
+            'num_sweep_points_detailed': 31,
+            'num_sweep_points_fast': 15,
+            # Metrics to evaluate (re-added after refactor)
+            'metrics': ['balanced', 'worst'],
         'interpolate_smooth_curves': True,  # Add interpolation for smoother plotting
     },
     'plugin_checkpoint': './checkpoints/argse_worst_eg_improved/cifar100_lt_if100/gse_balanced_plugin.ckpt',
@@ -317,6 +326,59 @@ def sweep_cost_values_aurc(confidence_scores_val, preds_val, labels_val,
     print(f"   >> Coverage range: {min(p[1] for p in rc_points):.3f} to {max(p[1] for p in rc_points):.3f}")
     return rc_points
 
+
+def build_dynamic_threshold_grid(raw_margins_val, target_min_coverage, num_points):
+    """Build a dynamic threshold grid directly in margin space to span coverage.
+
+    Instead of sweeping cost c in [0,1], we derive thresholds by taking quantiles of
+    the validation raw margins so that when applied to test set we obtain a broad coverage range.
+
+    Args:
+        raw_margins_val: tensor [N_val] raw margins on validation (tunev+val)
+        target_min_coverage: lowest coverage we want (e.g. 0.05 means choose threshold near high quantile)
+        num_points: number of threshold points desired
+
+    Returns:
+        thresholds: list of threshold values (descending -> increasing coverage)
+    """
+    # Coverage for threshold t is P(margin > t). To get low coverage we need t high.
+    # So we sample quantiles close to 1 - coverage.
+    # Convert desired coverage range [target_min_coverage, ~1.0] to quantiles of margins.
+    coverages = torch.linspace(target_min_coverage, 0.99, num_points)  # avoid exactly 1.0 for stability
+    # For coverage c: threshold t is quantile at (1 - c) of margins
+    quantile_ps = 1 - coverages
+    thresholds = torch.quantile(raw_margins_val, quantile_ps).tolist()
+    return thresholds, coverages.tolist()
+
+def sweep_thresholds_dynamic(raw_margins_val, preds_val, labels_val,
+                             raw_margins_test, preds_test, labels_test,
+                             class_to_group, K, threshold_values, class_weights=None, metric_type="balanced",
+                             use_per_group=False, t_group_base=None):
+    """Sweep pre-computed threshold values (in margin space) and produce RC points.
+
+    Args mirror cost sweep but threshold_values are raw margin thresholds directly.
+    """
+    rc_points = []
+    for i, t_val in enumerate(threshold_values):
+        if use_per_group and t_group_base is not None:
+            # Scale base thresholds so that original t_group corresponds to coverage near mid-range.
+            # Here t_val acts as a global offset added to each group threshold to align acceptance difficulty.
+            thresholds_per_group = t_group_base + (t_val - t_group_base.mean())
+            test_groups = class_to_group[labels_test]
+            thresholds_per_sample = thresholds_per_group[test_groups]
+            accepted_test = raw_margins_test > thresholds_per_sample
+        else:
+            accepted_test = raw_margins_test >= t_val
+        coverage_test = accepted_test.float().mean().item()
+        risk_test = compute_group_risk_for_aurc(preds_test, labels_test, accepted_test,
+                                               class_to_group, K, class_weights, metric_type)
+        # Store using 'threshold' field (reuse cost column name for backward compatibility)
+        rc_points.append((t_val, coverage_test, risk_test))
+        if (i + 1) % 5 == 0 or i == 0:
+            print(f"   Dynamic sweep progress: {i+1}/{len(threshold_values)} t={t_val:.4f} cov={coverage_test:.3f} risk={risk_test:.3f}")
+    print(f"   >> Dynamic coverage range: {min(p[1] for p in rc_points):.3f} to {max(p[1] for p in rc_points):.3f}")
+    return rc_points
+
 def compute_aurc_from_points(rc_points, coverage_range='full'):
     """
     Compute AURC using trapezoidal integration.
@@ -392,212 +454,113 @@ def compute_aurc_from_points(rc_points, coverage_range='full'):
 #############################################
 
 def plot_aurc_curves(all_rc_points, aurc_results, save_path):
-    """Plot risk vs rejection curves (following AR-GSE paper Figure 3 style)."""
-    plt.figure(figsize=(16, 5))
-    
-    # Colors for balanced and worst metrics (matching paper style)
-    colors = {'balanced': 'green', 'worst': 'orange'}
-    linestyles = {'balanced': '-', 'worst': '-'}
-    markers = {'balanced': 'v', 'worst': 'x'}
-    
-    # Import for interpolation
+    """Plot rejection-based curves and grouped AURC comparisons.
+
+    Layout (1 row, 3 columns):
+      1. Error vs Proportion of Rejections (Full 0-1)
+      2. Error vs Proportion of Rejections (Zoom 0-0.8)
+      3. Grouped bar chart: Full-range AURC vs Practical (0.2-1.0) for each metric.
+    """
     from scipy.interpolate import interp1d
-    
-    # Full range plot (X-axis: Proportion of Rejections)
-    plt.subplot(1, 3, 1)
+    colors = {'balanced': 'green', 'worst': 'orange'}
+    markers = {'balanced': 'v', 'worst': 'x'}
+    linestyles = {'balanced': '-', 'worst': '-'}
+
+    plt.figure(figsize=(18, 5))
+
+    # ---- Subplot 1: Full range rejection 0-1 ----
+    ax1 = plt.subplot(1, 3, 1)
     for metric, rc_points in all_rc_points.items():
         rc_points = sorted(rc_points, key=lambda x: x[1])
         coverages = np.array([p[1] for p in rc_points])
         risks = np.array([p[2] for p in rc_points])
-        
-        # Convert coverage to rejection rate
-        rejection_rates = 1.0 - coverages
-        
-        aurc = aurc_results[metric]
-        
-        # Plot original points
-        plt.scatter(rejection_rates, risks, color=colors[metric], s=50, marker=markers[metric], 
-                   edgecolor='white', linewidth=2, zorder=5, alpha=0.8)
-        
-        # Add smooth interpolation if we have enough points
-        if len(rejection_rates) >= 3:
+        rejection = 1.0 - coverages
+        aurc_full = aurc_results[metric]
+        ax1.scatter(rejection, risks, color=colors[metric], s=40, marker=markers[metric],
+                    edgecolor='white', linewidth=1.5, zorder=5, alpha=0.85)
+        if len(rejection) >= 4:
             try:
-                # Sort by rejection rate for interpolation
-                sort_idx = np.argsort(rejection_rates)
-                rejection_sorted = rejection_rates[sort_idx]
-                risks_sorted = risks[sort_idx]
-                
-                f = interp1d(rejection_sorted, risks_sorted, kind='cubic', fill_value='extrapolate')
-                rejection_smooth = np.linspace(rejection_sorted.min(), rejection_sorted.max(), 200)
-                risks_smooth = f(rejection_smooth)
-                
-                plt.plot(rejection_smooth, risks_smooth, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=2.5,
-                        label=f'{metric.title()} (AURC={aurc:.4f})', alpha=0.9)
+                idx = np.argsort(rejection)
+                f = interp1d(rejection[idx], risks[idx], kind='cubic', fill_value='extrapolate')
+                rej_smooth = np.linspace(rejection.min(), rejection.max(), 250)
+                risk_smooth = f(rej_smooth)
+                ax1.plot(rej_smooth, risk_smooth, color=colors[metric], linestyle=linestyles[metric],
+                         linewidth=2.2, label=f"{metric.title()} (AURC={aurc_full:.4f})")
             except Exception:
-                plt.plot(rejection_rates, risks, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=2.5,
-                        label=f'{metric.title()} (AURC={aurc:.4f})')
-                
+                ax1.plot(rejection, risks, color=colors[metric], linestyle=linestyles[metric],
+                         linewidth=2.2, label=f"{metric.title()} (AURC={aurc_full:.4f})")
         else:
-            plt.plot(rejection_rates, risks, color=colors[metric], 
-                    linestyle=linestyles[metric], linewidth=2.5,
-                    label=f'{metric.title()} (AURC={aurc:.4f})')
-    
-    plt.xlabel('Proportion of Rejections', fontsize=12, fontweight='bold')
-    plt.ylabel('Error', fontsize=12, fontweight='bold')
-    plt.title('Error vs Rejection Rate (Full Range)', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3, linestyle='--')
-    plt.legend(fontsize=11, loc='best')
-    plt.xlim(0, 1)
-    plt.ylim(0, None)
-    
-    # Focused range plot (rejection rate 0.0-0.8, equivalent to coverage 0.2-1.0)
-    plt.subplot(1, 3, 2)
+            ax1.plot(rejection, risks, color=colors[metric], linestyle=linestyles[metric],
+                     linewidth=2.2, label=f"{metric.title()} (AURC={aurc_full:.4f})")
+    ax1.set_xlabel('Proportion of Rejections', fontweight='bold')
+    ax1.set_ylabel('Error', fontweight='bold')
+    ax1.set_title('Error vs Rejection Rate (0-1)', fontweight='bold')
+    ax1.grid(alpha=0.3, linestyle='--')
+    ax1.set_xlim(0, 1)
+    ax1.legend(fontsize=10)
+
+    # ---- Subplot 2: Zoom rejection 0-0.8 ----
+    ax2 = plt.subplot(1, 3, 2)
     for metric, rc_points in all_rc_points.items():
         rc_points = sorted(rc_points, key=lambda x: x[1])
         coverages = np.array([p[1] for p in rc_points])
         risks = np.array([p[2] for p in rc_points])
-        
-        # Convert coverage to rejection rate
-        rejection_rates = 1.0 - coverages
-        
-        # Plot points
-        plt.scatter(rejection_rates, risks, color=colors[metric], s=50, marker=markers[metric],
-                   edgecolor='white', linewidth=2, zorder=5, alpha=0.8)
-        
-        # Add smooth interpolation (same as first plot)
-        if len(rejection_rates) >= 3:
+        rejection = 1.0 - coverages
+        ax2.scatter(rejection, risks, color=colors[metric], s=40, marker=markers[metric],
+                    edgecolor='white', linewidth=1.5, zorder=5, alpha=0.85)
+        if len(rejection) >= 4:
             try:
-                # Sort by rejection rate for interpolation
-                sort_idx = np.argsort(rejection_rates)
-                rejection_sorted = rejection_rates[sort_idx]
-                risks_sorted = risks[sort_idx]
-                
-                f = interp1d(rejection_sorted, risks_sorted, kind='cubic', fill_value='extrapolate')
-                rejection_smooth = np.linspace(rejection_sorted.min(), rejection_sorted.max(), 200)
-                risks_smooth = f(rejection_smooth)
-                
-                plt.plot(rejection_smooth, risks_smooth, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=2.5,
-                        label=f'{metric.title()}', alpha=0.9)
+                idx = np.argsort(rejection)
+                f = interp1d(rejection[idx], risks[idx], kind='cubic', fill_value='extrapolate')
+                rej_smooth = np.linspace(rejection.min(), min(0.8, rejection.max()), 200)
+                risk_smooth = f(rej_smooth)
+                ax2.plot(rej_smooth, risk_smooth, color=colors[metric], linestyle=linestyles[metric],
+                         linewidth=2.2, label=metric.title())
             except Exception:
-                plt.plot(rejection_rates, risks, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=2.5,
-                        label=f'{metric.title()}')
-                
+                ax2.plot(rejection, risks, color=colors[metric], linestyle=linestyles[metric],
+                         linewidth=2.2, label=metric.title())
         else:
-            plt.plot(rejection_rates, risks, color=colors[metric], 
-                    linestyle=linestyles[metric], linewidth=2.5,
-                    label=f'{metric.title()}')
-    
-    plt.xlabel('Proportion of Rejections', fontsize=12, fontweight='bold')
-    plt.ylabel('Error', fontsize=12, fontweight='bold')
-    plt.title('Error vs Rejection Rate (0.0-0.8)', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3, linestyle='--')
-    plt.legend(fontsize=11, loc='best')
-    plt.xlim(0.0, 0.8)  # Rejection rate 0-0.8 (equivalent to coverage 0.2-1.0)
-    plt.ylim(0, None)
-    
-    # Enhanced AURC comparison bar plot
-    plt.subplot(1, 3, 3)
-    metrics = list(aurc_results.keys())
-    # Filter to only show full range AURC (not _02_10 versions)
-    main_metrics = [m for m in metrics if not m.endswith('_02_10')]
-    aurcs = [aurc_results[m] for m in main_metrics]
-    
-    bar_colors = [colors[m] for m in main_metrics]
-    bars = plt.bar(main_metrics, aurcs, color=bar_colors, alpha=0.7, edgecolor='black', linewidth=2, width=0.5)
-    plt.ylabel('AURC Value', fontsize=12, fontweight='bold')
-    plt.title('AURC Comparison (Full Range)', fontsize=14, fontweight='bold')
-    plt.xticks(rotation=0, fontsize=11)
-    plt.grid(True, alpha=0.3, axis='y', linestyle='--')
-    
-    # Add value labels on bars with better positioning
-    for bar, aurc in zip(bars, aurcs):
-        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(aurcs)*0.01,
-                f'{aurc:.4f}', ha='center', va='bottom', fontsize=11, fontweight='bold')
-    
-    # Add percentage difference annotation
-    if len(aurcs) == 2:
-        balanced_aurc, worst_aurc = aurcs[0], aurcs[1]
-        diff_pct = ((worst_aurc - balanced_aurc) / balanced_aurc) * 100
-        plt.text(0.5, max(aurcs) * 0.5, f'Worst is {diff_pct:.1f}%\nhigher than Balanced', 
-                ha='center', va='center', fontsize=10, 
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.5))
-    
+            ax2.plot(rejection, risks, color=colors[metric], linestyle=linestyles[metric],
+                     linewidth=2.2, label=metric.title())
+    ax2.set_xlabel('Proportion of Rejections', fontweight='bold')
+    ax2.set_ylabel('Error', fontweight='bold')
+    ax2.set_title('Error vs Rejection Rate (0-0.8)', fontweight='bold')
+    ax2.grid(alpha=0.3, linestyle='--')
+    ax2.set_xlim(0, 0.8)
+    ax2.legend(fontsize=10)
+
+    # ---- Subplot 3: Grouped AURC bars (Full vs 0.2-1.0) ----
+    ax3 = plt.subplot(1, 3, 3)
+    metrics_main = [m for m in aurc_results.keys() if not m.endswith('_02_10')]
+    full_values = [aurc_results[m] for m in metrics_main]
+    practical_values = [aurc_results[f"{m}_02_10"] for m in metrics_main]
+    x = np.arange(len(metrics_main))
+    width = 0.35
+    bars1 = ax3.bar(x - width/2, full_values, width, label='Full (0-1)', color=[colors[m] for m in metrics_main], alpha=0.75, edgecolor='black')
+    bars2 = ax3.bar(x + width/2, practical_values, width, label='Practical (0.2-1.0)', color=[colors[m] for m in metrics_main], alpha=0.45, edgecolor='black', hatch='//')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels([m.title() for m in metrics_main], fontweight='bold')
+    ax3.set_ylabel('AURC', fontweight='bold')
+    ax3.set_title('AURC Comparison (Full vs 0.2-1.0)', fontweight='bold')
+    ax3.grid(alpha=0.3, axis='y', linestyle='--')
+    # Value labels
+    for bar in bars1:
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(full_values)*0.015,
+                 f"{bar.get_height():.4f}", ha='center', va='bottom', fontsize=9, fontweight='bold')
+    for bar in bars2:
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(practical_values)*0.015,
+                 f"{bar.get_height():.4f}", ha='center', va='bottom', fontsize=9)
+    # Difference annotation (worst vs balanced full)
+    if len(metrics_main) == 2:
+        diff_pct = ((full_values[1] - full_values[0]) / full_values[0]) * 100
+        ax3.text(0.5, max(full_values + practical_values) * 0.75,
+                 f"Worst full AURC +{diff_pct:.1f}% vs Balanced", ha='center', va='center',
+                 fontsize=10, bbox=dict(boxstyle='round,pad=0.4', facecolor='yellow', alpha=0.5))
+    ax3.legend(fontsize=10)
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f">> Saved AURC plots (Rejection-based) to {save_path}")
-    
-    # Focused range plot (0.2-1.0) - Simple zoom of the same data
-    plt.subplot(1, 3, 2)
-    for metric, rc_points in all_rc_points.items():
-        rc_points = sorted(rc_points, key=lambda x: x[1])
-        coverages = np.array([p[1] for p in rc_points])
-        risks = np.array([p[2] for p in rc_points])
-        
-        # Plot exactly the same data as the first plot, just zoomed in
-        # Plot points
-        plt.scatter(coverages, risks, color=colors[metric], s=50, marker=markers[metric],
-                   edgecolor='white', linewidth=2, zorder=5, alpha=0.8)
-        
-        # Add smooth interpolation (same as first plot)
-        if len(coverages) >= 3:
-            try:
-                f = interp1d(coverages, risks, kind='cubic', bounds_error=False, fill_value='extrapolate')
-                coverage_smooth = np.linspace(coverages.min(), coverages.max(), 100)
-                risks_smooth = f(coverage_smooth)
-                risks_smooth = np.clip(risks_smooth, 0, 1)
-                plt.plot(coverage_smooth, risks_smooth, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=2.5, alpha=0.7,
-                        label=f'{metric.title()}')
-            except Exception:
-                plt.plot(coverages, risks, color=colors[metric], 
-                        linestyle=linestyles[metric], linewidth=3,
-                        label=f'{metric.title()}')
-        else:
-            plt.plot(coverages, risks, color=colors[metric], 
-                    linestyle=linestyles[metric], linewidth=3,
-                    label=f'{metric.title()}')
-    
-    plt.xlabel('Coverage (Fraction Accepted)', fontsize=12)
-    plt.ylabel('Risk (Error on Accepted)', fontsize=12)
-    plt.title('Risk-Coverage Curves (0.2-1.0)', fontsize=14, fontweight='bold')
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=11)
-    plt.xlim(0.2, 1.0)  # Simply zoom to 0.2-1.0 range
-    plt.ylim(0, None)
-    
-    # Enhanced AURC comparison bar plot
-    plt.subplot(1, 3, 3)
-    metrics = list(aurc_results.keys())
-    # Filter to only show full range AURC (not _02_10 versions)
-    main_metrics = [m for m in metrics if not m.endswith('_02_10')]
-    aurcs = [aurc_results[m] for m in main_metrics]
-    
-    bar_colors = [colors[m] for m in main_metrics]
-    bars = plt.bar(main_metrics, aurcs, color=bar_colors, alpha=0.8, edgecolor='black', linewidth=2, width=0.6)
-    plt.ylabel('AURC Value', fontsize=12)
-    plt.title('AURC Comparison (Full Range)', fontsize=14, fontweight='bold')
-    plt.xticks(rotation=0, fontsize=11)
-    
-    # Add value labels on bars with better positioning
-    for bar, aurc in zip(bars, aurcs):
-        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(aurcs)*0.01,
-                f'{aurc:.4f}', ha='center', va='bottom', fontsize=12, fontweight='bold')
-    
-    # Add percentage difference annotation
-    if len(aurcs) == 2:
-        balanced_aurc, worst_aurc = aurcs[0], aurcs[1]
-        diff_pct = ((worst_aurc - balanced_aurc) / balanced_aurc) * 100
-        plt.text(0.5, max(aurcs) * 0.5, f'Worst is {diff_pct:.1f}%\nhigher than Balanced', 
-                ha='center', va='center', fontsize=10, 
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7))
-    
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f">> Saved enhanced AURC plots to {save_path}")
+    print(f">> Saved AURC plots to {save_path}")
 
 def main():
     # Reproducibility
@@ -755,26 +718,41 @@ def main():
             coverage_test = (gse_margins_test >= threshold).float().mean().item()
             print(f"   c={cost_c:.2f} → threshold={threshold:.4f} → coverage={coverage_test:.4f}")
     
-    # 6) Sweep cost values and compute AURC
+    # 6) Build sweep (cost or dynamic thresholds)
     mode = CONFIG['aurc_eval']['mode']
-    if mode == 'fast':
-        cost_values = CONFIG['aurc_eval']['cost_values_fast']
-    elif mode == 'detailed':
-        cost_values = CONFIG['aurc_eval']['cost_values_detailed']
-    elif mode == 'full':
-        cost_values = CONFIG['aurc_eval']['cost_values_full']
+    dynamic_enabled = CONFIG['aurc_eval'].get('use_dynamic_threshold_sweep', False)
+    if dynamic_enabled:
+        if mode == 'fast':
+            num_points = CONFIG['aurc_eval']['num_sweep_points_fast']
+        elif mode == 'detailed':
+            num_points = CONFIG['aurc_eval']['num_sweep_points_detailed']
+        elif mode == 'full':
+            num_points = CONFIG['aurc_eval']['num_sweep_points_full']
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Use 'fast', 'detailed', or 'full'")
+        thresholds, coverage_targets = build_dynamic_threshold_grid(
+            gse_margins_val_combined, CONFIG['aurc_eval']['target_min_coverage'], num_points
+        )
+        print(f"\n🎯 Dynamic threshold sweep ({mode}) with {len(thresholds)} points")
+        print(f"   Approx intended coverage range (validation-based): {coverage_targets[0]:.2f}→{coverage_targets[-1]:.2f}")
     else:
-        raise ValueError(f"Unknown mode: {mode}. Use 'fast', 'detailed', or 'full'")
-    
-    metrics = CONFIG['aurc_eval']['metrics']
-    print(f"\n🎯 Cost grid ({mode} mode): {len(cost_values)} values from {cost_values[0]:.1f} to {cost_values[-1]:.1f}")
-    if mode == 'fast':
-        print("   ⚡ Fast mode: Quick evaluation with strategic cost points")
-    elif mode == 'detailed':
-        print("   📈 Detailed mode: Better visualization with more points")
-    else:
-        print("   🎨 Full mode: Publication-quality smooth curves")
+        if mode == 'fast':
+            cost_values = CONFIG['aurc_eval']['cost_values_fast']
+        elif mode == 'detailed':
+            cost_values = CONFIG['aurc_eval']['cost_values_detailed']
+        elif mode == 'full':
+            cost_values = CONFIG['aurc_eval']['cost_values_full']
+        else:
+            raise ValueError(f"Unknown mode: {mode}. Use 'fast', 'detailed', or 'full'")
+        print(f"\n🎯 Cost grid ({mode} mode): {len(cost_values)} values from {cost_values[0]:.2f} to {cost_values[-1]:.2f}")
+        if mode == 'fast':
+            print("   ⚡ Fast mode: Quick evaluation with strategic cost points")
+        elif mode == 'detailed':
+            print("   📈 Detailed mode: Better visualization with more points")
+        else:
+            print("   🎨 Full mode: Publication-quality smooth curves")
 
+    metrics = CONFIG['aurc_eval']['metrics']
     aurc_results = {}
     all_rc_points = {}
     
@@ -794,19 +772,27 @@ def main():
     #     sweep_values = scale_values
     # else:
         # Global mode: use regular cost values
-    sweep_values = cost_values
+    sweep_values = cost_values if not dynamic_enabled else thresholds
     
     for metric in metrics:
         print(f"\n🔄 Processing {metric} metric {'(REWEIGHTED)' if class_weights else ''}...")
         print(f"   • Optimizing thresholds on validation (tunev + val): {len(labels_val_combined)} samples")
         print(f"   • Evaluating on test: {len(test_labels)} samples")
         
-        rc_points = sweep_cost_values_aurc(
-            gse_margins_val_combined, preds_val_combined, labels_val_combined,  # Validation
-            gse_margins_test, preds_test, test_labels,                          # Test
-            class_to_group_cpu, num_groups, sweep_values, class_weights, metric,  # Pass class_weights
-            use_per_group_thresholds, t_group_star.cpu() if use_per_group_thresholds else None  # Per-group params
-        )
+        if dynamic_enabled:
+            rc_points = sweep_thresholds_dynamic(
+                gse_margins_val_combined, preds_val_combined, labels_val_combined,
+                gse_margins_test, preds_test, test_labels,
+                class_to_group_cpu, num_groups, sweep_values, class_weights, metric,
+                use_per_group_thresholds, t_group_star.cpu() if use_per_group_thresholds else None
+            )
+        else:
+            rc_points = sweep_cost_values_aurc(
+                gse_margins_val_combined, preds_val_combined, labels_val_combined,  # Validation
+                gse_margins_test, preds_test, test_labels,                          # Test
+                class_to_group_cpu, num_groups, sweep_values, class_weights, metric,  # Pass class_weights
+                use_per_group_thresholds, t_group_star.cpu() if use_per_group_thresholds else None  # Per-group params
+            )
         aurc_full = compute_aurc_from_points(rc_points, coverage_range='full')
         aurc_02_10 = compute_aurc_from_points(rc_points, coverage_range='0.2-1.0')
         aurc_results[metric] = aurc_full
@@ -818,12 +804,32 @@ def main():
     # 6) Save results
     output_dir.mkdir(parents=True, exist_ok=True)
     aurc_rows = []
+    # Distinguish dynamic threshold sweep vs cost sweep to avoid confusion about negative "cost" values
+    sweep_type = 'dynamic_threshold' if dynamic_enabled else 'cost'
     for metric, rc_points in all_rc_points.items():
-        for cost_c, coverage, risk in rc_points:
-            aurc_rows.append({'metric': metric, 'cost': cost_c, 'coverage': coverage, 'risk': risk})
+        for sweep_val, coverage, risk in rc_points:
+            row = {
+                'metric': metric,
+                ('threshold' if dynamic_enabled else 'cost'): sweep_val,
+                'coverage': coverage,
+                'risk': risk
+            }
+            # Keep both columns for convenience if dynamic (cost reconstructed as -threshold for global mode)
+            if dynamic_enabled and not use_per_group_thresholds:
+                row['cost_equivalent'] = -sweep_val  # threshold = t, global accept rule margin >= t => cost c = -t
+            aurc_rows.append(row)
     pd.DataFrame(aurc_rows).to_csv(output_dir / 'aurc_detailed_results.csv', index=False)
+    # Augment summary with metadata
+    summary_payload = {
+        'aurc': aurc_results,
+        'sweep_type': sweep_type,
+        'mode': mode,
+        'num_points': len(next(iter(all_rc_points.values()))),
+        'per_group_thresholds': bool(use_per_group_thresholds),
+        'dynamic_enabled': bool(dynamic_enabled)
+    }
     with open(output_dir / 'aurc_summary.json', 'w') as f:
-        json.dump(aurc_results, f, indent=4)
+        json.dump(summary_payload, f, indent=4)
     plot_aurc_curves(all_rc_points, aurc_results, output_dir / 'aurc_curves.png')
 
     # 7) Final summary

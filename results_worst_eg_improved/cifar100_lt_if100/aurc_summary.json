@@ -1,6 +1,13 @@
 {
-    "balanced": 0.16756497200636689,
-    "balanced_02_10": 0.09803558852913971,
-    "worst": 0.24220554445202103,
-    "worst_02_10": 0.12039701417060701
+    "aurc": {
+        "balanced": 0.35639084403748267,
+        "balanced_02_10": 0.2737942776251215,
+        "worst": 0.5105135719006675,
+        "worst_02_10": 0.366087138070408
+    },
+    "sweep_type": "dynamic_threshold",
+    "mode": "detailed",
+    "num_points": 31,
+    "per_group_thresholds": true,
+    "dynamic_enabled": true
 }
